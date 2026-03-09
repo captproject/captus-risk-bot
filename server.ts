@@ -237,7 +237,7 @@ async function performLogin(page: Page, username: string, password: string): Pro
     await passwordField.fill(password);
 
     // Click login button
-    const loginButton = page.getByTestId("Sign In");
+    const loginButton = page.getByTestId("button-login");
     await loginButton.waitFor({ state: "visible", timeout: 5000 });
     await loginButton.click();
 
@@ -307,7 +307,7 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     // ── Step 2: Click "Add Risk" button ────────────────────────────────────
 
     console.log("[Risk] Clicking Add Risk button...");
-    const addRiskBtn = page.getByTestId("Add Risk");
+    const addRiskBtn = page.getByTestId("button-add-risk");
     await addRiskBtn.waitFor({ state: "visible", timeout: 10000 });
     await addRiskBtn.click();
     await page.waitForTimeout(2000);
@@ -378,7 +378,7 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     // ── Step 13: Click "Create Risk" ───────────────────────────────────────
 
     console.log("[Risk] Clicking Create Risk button...");
-    const saveBtn = page.getByTestId("Create Risk");
+    const saveBtn = page.getByTestId("button-save-risk");
     await saveBtn.waitFor({ state: "visible", timeout: 5000 });
     await saveBtn.click();
 
