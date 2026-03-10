@@ -369,12 +369,6 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     await fillInput(page, "input-risk-mitigation", input.mitigationPlan);
     await page.waitForTimeout(300);
 
-    // ── Screenshot 1: Form Filled ──────────────────────────────────────────
-
-    console.log("[Risk] Capturing form screenshot...");
-    const formScreenshot = await page.screenshot({ fullPage: true });
-    result.screenshots.form_filled = await uploadScreenshot(formScreenshot, "form_filled");
-
     // ── Step 13: Click "Create Risk" ───────────────────────────────────────
 
     console.log("[Risk] Clicking Create Risk button...");
@@ -382,46 +376,37 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     await saveBtn.waitFor({ state: "visible", timeout: 5000 });
     await saveBtn.click();
 
-    // ── Step 14: Wait for and detect success message ───────────────────────
+    // ── Step 14: Wait for and validate success message ─────────────────────
 
     console.log("[Risk] Waiting for success message...");
     await page.waitForTimeout(3000);
 
     // Try to find the success toast using getByText
     const successToast = page.getByText("Risk created successfully");
-    const successDetected = await successToast.isVisible().catch(() => false);
+    let successDetected = await successToast.isVisible().catch(() => false);
 
-    // ── Screenshot 2: Success Message ──────────────────────────────────────
-
-    const successScreenshot = await page.screenshot({ fullPage: true });
-    result.screenshots.success_message = await uploadScreenshot(successScreenshot, "success_message");
-
+    // Fallback: check full page text
     if (!successDetected) {
-      // Fallback: check full page text
       const bodyText = await page.locator("body").innerText();
-      const hasSuccess = bodyText.toLowerCase().includes("risk created successfully");
-
-      if (!hasSuccess) {
-        result.status = "failed";
-        result.message = "Risk creation failed — success message not detected";
-        console.log("[Risk] FAILED — success message not found");
-        await context.close();
-        return result;
-      }
+      successDetected = bodyText.toLowerCase().includes("risk created successfully");
     }
 
-    console.log("[Risk] Success message detected!");
+    if (!successDetected) {
+      // FAILURE — capture screenshot of the failed state
+      console.log("[Risk] FAILED — success message not found");
+      const failScreenshot = await page.screenshot({ fullPage: true });
+      result.screenshots.form_filled = await uploadScreenshot(failScreenshot, "create_risk_failed");
+      result.status = "failed";
+      result.message = "Risk creation failed — success message not detected";
+      await context.close();
+      return result;
+    }
 
-    // ── Step 15: Wait for table to update ──────────────────────────────────
+    console.log("[Risk] Success message validated!");
+
+    // ── Step 15: Wait for table to update and verify ───────────────────────
 
     await page.waitForTimeout(3000);
-
-    // ── Screenshot 3: Risk in Table ────────────────────────────────────────
-
-    const tableScreenshot = await page.screenshot({ fullPage: true });
-    result.screenshots.risk_in_table = await uploadScreenshot(tableScreenshot, "risk_in_table");
-
-    // ── Verify risk appears in the table using getByText ───────────────────
 
     const riskInTable = page.getByText(input.title);
     const riskVisible = await riskInTable.isVisible().catch(() => false);
@@ -431,9 +416,12 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
       result.message = "Risk created successfully and visible in table";
       console.log("[Risk] Risk confirmed in table!");
     } else {
+      // Risk not in table — capture screenshot for debugging
+      const tableFailScreenshot = await page.screenshot({ fullPage: true });
+      result.screenshots.risk_in_table = await uploadScreenshot(tableFailScreenshot, "risk_not_in_table");
       result.status = "success";
-      result.message = "Risk created successfully — toast confirmed, table verification pending";
-      console.log("[Risk] Toast confirmed, table not yet verified");
+      result.message = "Risk created successfully — toast confirmed, but risk not visible in table yet";
+      console.log("[Risk] Toast confirmed, risk not yet visible in table");
     }
 
     await context.close();
