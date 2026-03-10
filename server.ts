@@ -219,27 +219,46 @@ async function performLogin(page: Page, username: string, password: string): Pro
       timeout: config.navigationTimeout,
     });
 
-    // Wait for email field using getByTestId
-    const emailField = page.getByTestId("input-email");
-    await emailField.waitFor({ state: "visible", timeout: 15000 });
+    // Wait for email field
+    await page.waitForSelector('input[name="email"]', {
+      state: "visible",
+      timeout: 15000,
+    });
 
     // Wait for React hydration
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(5000);
 
-    // Fill email
-    await emailField.clear();
-    await emailField.fill(username);
+    // Fill email using React's native value setter (proven method from login bot)
+    await page.evaluate((email) => {
+      const input = document.querySelector('input[name="email"]') as HTMLInputElement;
+      if (input) {
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, "value"
+        )?.set;
+        if (setter) setter.call(input, email);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }, username);
 
-    // Fill password
-    const passwordField = page.getByTestId("input-password");
-    await passwordField.waitFor({ state: "visible", timeout: 5000 });
-    await passwordField.clear();
-    await passwordField.fill(password);
+    // Fill password using React's native value setter
+    await page.evaluate((pass) => {
+      const input = document.querySelector('input[name="password"]') as HTMLInputElement;
+      if (input) {
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, "value"
+        )?.set;
+        if (setter) setter.call(input, pass);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }, password);
 
-    // Click login button
-    const loginButton = page.getByTestId("button-login");
-    await loginButton.waitFor({ state: "visible", timeout: 5000 });
-    await loginButton.click();
+    // Click login button via evaluate
+    await page.evaluate(() => {
+      const btn = document.querySelector('button[data-testid="button-login"]') as HTMLButtonElement;
+      if (btn) btn.click();
+    });
 
     // Wait for navigation
     await page.waitForTimeout(5000);
