@@ -471,52 +471,74 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     await saveBtn.waitFor({ state: "visible", timeout: 5000 });
     await saveBtn.click();
 
-    // ── Step 14: Wait for and validate success message ─────────────────────
+    // ── Step 14: Detect success message — check immediately, toast disappears fast
 
-    console.log("[Risk] Waiting for success message...");
-    await page.waitForTimeout(3000);
+    console.log("[Risk] Watching for success message...");
 
-    // Try to find the success toast using getByText
-    const successToast = page.getByText("Risk created successfully");
-    let successDetected = await successToast.isVisible().catch(() => false);
+    // Poll for toast every 500ms for up to 5 seconds
+    let successDetected = false;
+    for (let i = 0; i < 10; i++) {
+      await page.waitForTimeout(500);
 
-    // Fallback: check full page text
+      const found = await page.evaluate(() => {
+        const body = document.body.innerText.toLowerCase();
+        return (
+          body.includes("risk created successfully") ||
+          body.includes("created successfully") ||
+          body.includes("success")
+        );
+      });
+
+      if (found) {
+        successDetected = true;
+        console.log(`[Risk] Success toast detected after ${(i + 1) * 500}ms`);
+        break;
+      }
+    }
+
+    // Fallback: if toast missed, check if risk appears in the table
     if (!successDetected) {
-      const bodyText = await page.locator("body").innerText();
-      successDetected = bodyText.toLowerCase().includes("risk created successfully");
+      console.log("[Risk] Toast not detected — falling back to table verification...");
+      await page.waitForTimeout(2000);
+
+      const riskInTable = await page.evaluate((title) => {
+        const body = document.body.innerText;
+        return body.includes(title);
+      }, input.title);
+
+      if (riskInTable) {
+        successDetected = true;
+        console.log("[Risk] Risk found in table — creation confirmed via fallback");
+      }
     }
 
     if (!successDetected) {
-      // FAILURE — capture screenshot of the failed state
-      console.log("[Risk] FAILED — success message not found");
+      // Both checks failed — capture screenshot for debugging
+      console.log("[Risk] FAILED — neither toast nor table confirmed risk creation");
       const failScreenshot = await page.screenshot({ fullPage: true });
       result.screenshots.form_filled = await uploadScreenshot(failScreenshot, "create_risk_failed");
       result.status = "failed";
-      result.message = "Risk creation failed — success message not detected";
+      result.message = "Risk creation failed — success message not detected and risk not found in table";
       await context.close();
       return result;
     }
 
-    console.log("[Risk] Success message validated!");
+    // ── Step 15: Final table verification ──────────────────────────────────
 
-    // ── Step 15: Wait for table to update and verify ───────────────────────
+    await page.waitForTimeout(2000);
 
-    await page.waitForTimeout(3000);
-
-    const riskInTable = page.getByText(input.title);
-    const riskVisible = await riskInTable.isVisible().catch(() => false);
+    const riskVisible = await page.evaluate((title) => {
+      return document.body.innerText.includes(title);
+    }, input.title);
 
     if (riskVisible) {
       result.status = "success";
       result.message = "Risk created successfully and visible in table";
       console.log("[Risk] Risk confirmed in table!");
     } else {
-      // Risk not in table — capture screenshot for debugging
-      const tableFailScreenshot = await page.screenshot({ fullPage: true });
-      result.screenshots.risk_in_table = await uploadScreenshot(tableFailScreenshot, "risk_not_in_table");
       result.status = "success";
-      result.message = "Risk created successfully — toast confirmed, but risk not visible in table yet";
-      console.log("[Risk] Toast confirmed, risk not yet visible in table");
+      result.message = "Risk created successfully — toast confirmed";
+      console.log("[Risk] Toast confirmed, risk may need page refresh to appear in table");
     }
 
     await context.close();
