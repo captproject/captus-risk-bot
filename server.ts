@@ -159,55 +159,107 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
   await dateButton.click();
 
   // Wait for calendar to open
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(1000);
 
-  // Parse target date
-  const targetDate = new Date(dateString);
-  const targetDay = targetDate.getDate().toString();
+  // Parse target date — expects yyyy-MM-dd format
+  const parts = dateString.split("-");
+  const targetYear = parseInt(parts[0]);
+  const targetMonth = parseInt(parts[1]);
+  const targetDay = parseInt(parts[2]).toString();
 
-  // Navigate months if needed
-  const targetMonth = targetDate.toLocaleString("en-US", { month: "long" });
-  const targetYear = targetDate.getFullYear().toString();
-  const targetMonthYear = `${targetMonth} ${targetYear}`;
+  const monthNames = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+  ];
+  const targetMonthName = monthNames[targetMonth - 1];
+  const targetMonthYear = `${targetMonthName} ${targetYear}`;
 
-  // Check current calendar month and navigate forward if needed
+  console.log(`[Risk] Looking for calendar month: ${targetMonthYear}, day: ${targetDay}`);
+
+  // Navigate to correct month — max 12 attempts to prevent infinite loop
   for (let i = 0; i < 12; i++) {
-    const calendarHeading = page.locator('[role="heading"]').filter({ hasText: /\w+ \d{4}/ });
-    const currentMonthText = await calendarHeading.textContent().catch(() => "");
+    // Check current calendar heading
+    const headingText = await page.evaluate(() => {
+      const headings = document.querySelectorAll('[role="heading"]');
+      for (const h of headings) {
+        const text = h.textContent?.trim() || "";
+        if (/[A-Z][a-z]+ \d{4}/.test(text)) {
+          return text;
+        }
+      }
+      return "";
+    });
 
-    if (currentMonthText?.includes(targetMonthYear)) {
+    console.log(`[Risk] Current calendar month: ${headingText}`);
+
+    if (headingText.includes(targetMonthYear)) {
+      console.log("[Risk] Correct month found");
       break;
     }
 
-    // Click next month button
-    const nextButton = page.getByRole("button", { name: /next month|chevron/i });
-    if (await nextButton.isVisible().catch(() => false)) {
-      await nextButton.click();
-      await page.waitForTimeout(300);
-    } else {
-      // Fallback: try aria-label based navigation
-      const navNext = page.locator('button[name="next-month"], button[aria-label="Go to next month"]');
-      if (await navNext.isVisible().catch(() => false)) {
-        await navNext.click();
-        await page.waitForTimeout(300);
-      } else {
-        break;
+    // Click next month button — try multiple selectors
+    const clicked = await page.evaluate(() => {
+      // Try common next month button selectors
+      const selectors = [
+        'button[name="next-month"]',
+        'button[aria-label="Go to next month"]',
+        'button.rdp-button_next',
+        'button.nav-button-next',
+      ];
+      for (const sel of selectors) {
+        const btn = document.querySelector(sel) as HTMLButtonElement;
+        if (btn) {
+          btn.click();
+          return true;
+        }
+      }
+      // Fallback: find button with chevron-right SVG
+      const buttons = document.querySelectorAll('button');
+      for (const btn of buttons) {
+        if (btn.querySelector('svg path[d*="9 18l6-6-6-6"]') ||
+            btn.getAttribute('aria-label')?.toLowerCase().includes('next')) {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (!clicked) {
+      console.log("[Risk] Could not find next month button — stopping navigation");
+      break;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  // Click the target day
+  console.log(`[Risk] Clicking day: ${targetDay}`);
+  await page.evaluate((day) => {
+    // Find all day buttons in the calendar
+    const cells = document.querySelectorAll('[role="gridcell"]');
+    for (const cell of cells) {
+      const button = cell.querySelector("button");
+      const textEl = button || cell;
+      const text = textEl.textContent?.trim();
+
+      if (text === day) {
+        // Skip disabled or outside-month days
+        const isDisabled = button?.hasAttribute("disabled") ||
+          cell.classList.toString().includes("outside") ||
+          cell.getAttribute("aria-disabled") === "true";
+
+        if (!isDisabled) {
+          (button || cell as HTMLElement).click();
+          console.log(`Clicked day: ${day}`);
+          return;
+        }
       }
     }
-  }
+  }, targetDay);
 
-  // Click the target day using getByRole gridcell
-  const dayCell = page.getByRole("gridcell", { name: targetDay, exact: true });
-  const dayButton = dayCell.locator("button").first();
-
-  if (await dayButton.isVisible().catch(() => false)) {
-    await dayButton.click();
-  } else {
-    // Fallback: click the gridcell directly
-    await dayCell.click();
-  }
-
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(500);
+  console.log("[Risk] Due date set");
 }
 
 // ─── Core Login Logic using Built-in Locators ────────────────────────────────
