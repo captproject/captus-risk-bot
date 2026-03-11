@@ -124,10 +124,26 @@ async function uploadScreenshot(
 // ─── Helper: Fill Text Input using getByTestId ───────────────────────────────
 
 async function fillInput(page: Page, testId: string, value: string): Promise<void> {
-  const locator = page.getByTestId(testId);
-  await locator.waitFor({ state: "visible", timeout: 10000 });
-  await locator.clear();
-  await locator.fill(value);
+  // Use React's native value setter — proven method that triggers React state updates
+  await page.evaluate(
+    ({ testId, val }) => {
+      const input = document.querySelector(`[data-testid="${testId}"]`) as HTMLInputElement | HTMLTextAreaElement;
+      if (input) {
+        // Determine the correct prototype (input vs textarea)
+        const proto = input.tagName === "TEXTAREA"
+          ? window.HTMLTextAreaElement.prototype
+          : window.HTMLInputElement.prototype;
+
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        if (setter) {
+          setter.call(input, val);
+        }
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    },
+    { testId, val: value }
+  );
 }
 
 // ─── Helper: Select Dropdown Option (Radix UI) using getByTestId ─────────────
