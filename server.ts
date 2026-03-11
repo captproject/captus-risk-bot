@@ -180,9 +180,15 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
   for (let i = 0; i < 12; i++) {
     // Check current calendar heading
     const headingText = await page.evaluate(() => {
-      const headings = document.querySelectorAll('[role="heading"]');
-      for (const h of headings) {
-        const text = h.textContent?.trim() || "";
+      // Primary: react-day-picker heading
+      const rdp = document.querySelector('[id^="react-day-picker"]');
+      if (rdp && rdp.textContent?.trim()) {
+        return rdp.textContent.trim();
+      }
+      // Fallback: any element with role="presentation" that looks like a month
+      const presentations = document.querySelectorAll('[role="presentation"]');
+      for (const el of presentations) {
+        const text = el.textContent?.trim() || "";
         if (/[A-Z][a-z]+ \d{4}/.test(text)) {
           return text;
         }
@@ -197,14 +203,16 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
       break;
     }
 
-    // Click next month button — try multiple selectors
+    // Click next month button — try react-day-picker selectors first
     const clicked = await page.evaluate(() => {
-      // Try common next month button selectors
+      // Primary: react-day-picker next button
       const selectors = [
         'button[name="next-month"]',
         'button[aria-label="Go to next month"]',
         'button.rdp-button_next',
-        'button.nav-button-next',
+        'button.rdp-nav_button_next',
+        '.rdp-nav button:last-child',
+        'button[aria-label="Go to the next month"]',
       ];
       for (const sel of selectors) {
         const btn = document.querySelector(sel) as HTMLButtonElement;
@@ -213,11 +221,11 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
           return true;
         }
       }
-      // Fallback: find button with chevron-right SVG
-      const buttons = document.querySelectorAll('button');
-      for (const btn of buttons) {
-        if (btn.querySelector('svg path[d*="9 18l6-6-6-6"]') ||
-            btn.getAttribute('aria-label')?.toLowerCase().includes('next')) {
+      // Fallback: find any nav button with right chevron
+      const allButtons = document.querySelectorAll('button');
+      for (const btn of allButtons) {
+        const label = btn.getAttribute('aria-label') || '';
+        if (label.toLowerCase().includes('next')) {
           btn.click();
           return true;
         }
