@@ -18,43 +18,21 @@ interface RiskInput {
   mitigationPlan: string;
 }
 
-interface EditRiskInput {
-  username: string;
-  password: string;
-  searchTitle: string;
-  newTitle?: string;
-  newDescription?: string;
-  newCategory?: string;
-  newStatus?: string;
-  newImpact?: string;
-  newLikelihood?: string;
-  newOwner?: string;
-  newDueDate?: string;
-  newPotentialCost?: string;
-  newMitigationPlan?: string;
-}
-
-interface DeleteRiskInput {
-  username: string;
-  password: string;
-  searchTitle: string;
-}
-
 interface RiskResult {
   status: "success" | "failed" | "error";
   message: string;
   username: string;
   riskTitle: string;
   screenshots: {
-    failure?: string | null;
-    table_issue?: string | null;
+    form_filled: string | null;
+    success_message: string | null;
+    risk_in_table: string | null;
   };
 }
 
 interface Config {
   loginUrl: string;
   dashboardUrl: string;
-  tableUrl: string;
   apiKey: string;
   supabaseUrl: string;
   supabaseKey: string;
@@ -67,7 +45,6 @@ interface Config {
 const config: Config = {
   loginUrl: process.env.LOGIN_URL || "https://captus.replit.app/login",
   dashboardUrl: process.env.DASHBOARD_URL || "https://captus.replit.app/dashboard",
-  tableUrl: process.env.TABLE_URL || "https://captus.replit.app/table",
   apiKey: process.env.API_KEY || "",
   supabaseUrl: process.env.SUPABASE_URL || "",
   supabaseKey: process.env.SUPABASE_KEY || "",
@@ -144,13 +121,15 @@ async function uploadScreenshot(
   }
 }
 
-// ─── Helper: Fill Text Input (React Native Setter) ──────────────────────────
+// ─── Helper: Fill Text Input using getByTestId ───────────────────────────────
 
 async function fillInput(page: Page, testId: string, value: string): Promise<void> {
+  // Use React's native value setter — proven method that triggers React state updates
   await page.evaluate(
     ({ testId, val }) => {
       const input = document.querySelector(`[data-testid="${testId}"]`) as HTMLInputElement | HTMLTextAreaElement;
       if (input) {
+        // Determine the correct prototype (input vs textarea)
         const proto = input.tagName === "TEXTAREA"
           ? window.HTMLTextAreaElement.prototype
           : window.HTMLInputElement.prototype;
@@ -167,31 +146,38 @@ async function fillInput(page: Page, testId: string, value: string): Promise<voi
   );
 }
 
-// ─── Helper: Select Dropdown Option (Radix UI) ──────────────────────────────
+// ─── Helper: Select Dropdown Option (Radix UI) using getByTestId ─────────────
 
 async function selectDropdown(page: Page, triggerTestId: string, optionText: string): Promise<void> {
+  // Click dropdown trigger using built-in locator
   const trigger = page.getByTestId(triggerTestId);
   await trigger.waitFor({ state: "visible", timeout: 10000 });
   await trigger.click();
 
+  // Wait for dropdown to open
   await page.waitForTimeout(500);
 
+  // Click the matching option using getByRole + text filter
   const option = page.getByRole("option", { name: optionText });
   await option.waitFor({ state: "visible", timeout: 5000 });
   await option.click();
 
+  // Wait for dropdown to close
   await page.waitForTimeout(300);
 }
 
-// ─── Helper: Set Due Date ────────────────────────────────────────────────────
+// ─── Helper: Set Due Date using getByTestId ──────────────────────────────────
 
 async function setDueDate(page: Page, dateString: string): Promise<void> {
+  // Click date picker button
   const dateButton = page.getByTestId("button-risk-due-date");
   await dateButton.waitFor({ state: "visible", timeout: 10000 });
   await dateButton.click();
 
+  // Wait for calendar to open
   await page.waitForTimeout(1000);
 
+  // Parse target date — expects yyyy-MM-dd format
   const parts = dateString.split("-");
   const targetYear = parseInt(parts[0]);
   const targetMonth = parseInt(parts[1]);
@@ -206,12 +192,16 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
 
   console.log(`[Risk] Looking for calendar month: ${targetMonthYear}, day: ${targetDay}`);
 
+  // Navigate to correct month — max 12 attempts to prevent infinite loop
   for (let i = 0; i < 12; i++) {
+    // Check current calendar heading
     const headingText = await page.evaluate(() => {
+      // Primary: react-day-picker heading
       const rdp = document.querySelector('[id^="react-day-picker"]');
       if (rdp && rdp.textContent?.trim()) {
         return rdp.textContent.trim();
       }
+      // Fallback: any element with role="presentation" that looks like a month
       const presentations = document.querySelectorAll('[role="presentation"]');
       for (const el of presentations) {
         const text = el.textContent?.trim() || "";
@@ -229,7 +219,9 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
       break;
     }
 
+    // Click next month button — try react-day-picker selectors first
     const clicked = await page.evaluate(() => {
+      // Primary: react-day-picker next button
       const selectors = [
         'button[name="next-month"]',
         'button[aria-label="Go to next month"]',
@@ -245,6 +237,7 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
           return true;
         }
       }
+      // Fallback: find any nav button with right chevron
       const allButtons = document.querySelectorAll('button');
       for (const btn of allButtons) {
         const label = btn.getAttribute('aria-label') || '';
@@ -264,8 +257,10 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
     await page.waitForTimeout(500);
   }
 
+  // Click the target day
   console.log(`[Risk] Clicking day: ${targetDay}`);
   await page.evaluate((day) => {
+    // Find all day buttons in the calendar
     const cells = document.querySelectorAll('[role="gridcell"]');
     for (const cell of cells) {
       const button = cell.querySelector("button");
@@ -273,12 +268,14 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
       const text = textEl.textContent?.trim();
 
       if (text === day) {
+        // Skip disabled or outside-month days
         const isDisabled = button?.hasAttribute("disabled") ||
           cell.classList.toString().includes("outside") ||
           cell.getAttribute("aria-disabled") === "true";
 
         if (!isDisabled) {
           (button || cell as HTMLElement).click();
+          console.log(`Clicked day: ${day}`);
           return;
         }
       }
@@ -289,56 +286,7 @@ async function setDueDate(page: Page, dateString: string): Promise<void> {
   console.log("[Risk] Due date set");
 }
 
-// ─── Helper: Search for Risk by Title ────────────────────────────────────────
-
-async function searchRisk(page: Page, title: string): Promise<void> {
-  console.log(`[Risk] Searching for: ${title}`);
-
-  // Clear and fill search bar using React native setter
-  await page.evaluate(
-    (searchText) => {
-      const input = document.querySelector('[data-testid="input-search-risks"]') as HTMLInputElement;
-      if (input) {
-        const setter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, "value"
-        )?.set;
-        if (setter) setter.call(input, searchText);
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    },
-    title
-  );
-
-  // Wait for search results to filter
-  await page.waitForTimeout(2000);
-  console.log("[Risk] Search completed");
-}
-
-// ─── Helper: Detect Toast Message ────────────────────────────────────────────
-
-async function detectToast(page: Page, expectedText: string): Promise<boolean> {
-  console.log(`[Risk] Watching for toast: "${expectedText}"...`);
-
-  for (let i = 0; i < 10; i++) {
-    await page.waitForTimeout(500);
-
-    const found = await page.evaluate((text) => {
-      const body = document.body.innerText.toLowerCase();
-      return body.includes(text.toLowerCase());
-    }, expectedText);
-
-    if (found) {
-      console.log(`[Risk] Toast detected after ${(i + 1) * 500}ms`);
-      return true;
-    }
-  }
-
-  console.log("[Risk] Toast not detected within 5 seconds");
-  return false;
-}
-
-// ─── Core Login Logic ────────────────────────────────────────────────────────
+// ─── Core Login Logic using Built-in Locators ────────────────────────────────
 
 async function performLogin(page: Page, username: string, password: string): Promise<boolean> {
   try {
@@ -347,13 +295,16 @@ async function performLogin(page: Page, username: string, password: string): Pro
       timeout: config.navigationTimeout,
     });
 
+    // Wait for email field
     await page.waitForSelector('input[name="email"]', {
       state: "visible",
       timeout: 15000,
     });
 
+    // Wait for React hydration
     await page.waitForTimeout(5000);
 
+    // Fill email using React's native value setter (proven method from login bot)
     await page.evaluate((email) => {
       const input = document.querySelector('input[name="email"]') as HTMLInputElement;
       if (input) {
@@ -366,6 +317,7 @@ async function performLogin(page: Page, username: string, password: string): Pro
       }
     }, username);
 
+    // Fill password using React's native value setter
     await page.evaluate((pass) => {
       const input = document.querySelector('input[name="password"]') as HTMLInputElement;
       if (input) {
@@ -378,11 +330,13 @@ async function performLogin(page: Page, username: string, password: string): Pro
       }
     }, password);
 
+    // Click login button via evaluate
     await page.evaluate(() => {
       const btn = document.querySelector('button[data-testid="button-login"]') as HTMLButtonElement;
       if (btn) btn.click();
     });
 
+    // Wait for navigation
     await page.waitForTimeout(5000);
 
     const currentUrl = page.url();
@@ -393,119 +347,7 @@ async function performLogin(page: Page, username: string, password: string): Pro
   }
 }
 
-// ─── Helper: Fill Risk Form (used by Create and Edit) ────────────────────────
-
-async function fillRiskForm(page: Page, data: {
-  title?: string;
-  description?: string;
-  category?: string;
-  status?: string;
-  impact?: string;
-  likelihood?: string;
-  owner?: string;
-  dueDate?: string;
-  potentialCost?: string;
-  mitigationPlan?: string;
-}): Promise<void> {
-
-  if (data.title) {
-    console.log(`[Risk] Filling title: ${data.title}`);
-    // Clear existing value first
-    await page.evaluate(() => {
-      const input = document.querySelector('[data-testid="input-risk-title"]') as HTMLInputElement;
-      if (input) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-        if (setter) setter.call(input, '');
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    });
-    await fillInput(page, "input-risk-title", data.title);
-    await page.waitForTimeout(300);
-  }
-
-  if (data.description) {
-    console.log(`[Risk] Filling description`);
-    await page.evaluate(() => {
-      const input = document.querySelector('[data-testid="input-risk-description"]') as HTMLTextAreaElement;
-      if (input) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-        if (setter) setter.call(input, '');
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    });
-    await fillInput(page, "input-risk-description", data.description);
-    await page.waitForTimeout(300);
-  }
-
-  if (data.category) {
-    console.log(`[Risk] Selecting category: ${data.category}`);
-    await selectDropdown(page, "select-risk-category", data.category);
-  }
-
-  if (data.status) {
-    console.log(`[Risk] Selecting status: ${data.status}`);
-    await selectDropdown(page, "select-risk-status", data.status);
-  }
-
-  if (data.impact) {
-    console.log(`[Risk] Selecting impact: ${data.impact}`);
-    await selectDropdown(page, "select-risk-impact", data.impact);
-  }
-
-  if (data.likelihood) {
-    console.log(`[Risk] Selecting likelihood: ${data.likelihood}`);
-    await selectDropdown(page, "select-risk-likelihood", data.likelihood);
-  }
-
-  if (data.owner) {
-    console.log(`[Risk] Filling owner: ${data.owner}`);
-    await page.evaluate(() => {
-      const input = document.querySelector('[data-testid="input-risk-owner"]') as HTMLInputElement;
-      if (input) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-        if (setter) setter.call(input, '');
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    });
-    await fillInput(page, "input-risk-owner", data.owner);
-    await page.waitForTimeout(300);
-  }
-
-  if (data.dueDate) {
-    console.log(`[Risk] Setting due date: ${data.dueDate}`);
-    await setDueDate(page, data.dueDate);
-  }
-
-  if (data.potentialCost) {
-    console.log(`[Risk] Filling potential cost: ${data.potentialCost}`);
-    await page.evaluate(() => {
-      const input = document.querySelector('[data-testid="input-risk-potential-cost"]') as HTMLInputElement;
-      if (input) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-        if (setter) setter.call(input, '');
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    });
-    await fillInput(page, "input-risk-potential-cost", data.potentialCost);
-    await page.waitForTimeout(300);
-  }
-
-  if (data.mitigationPlan) {
-    console.log(`[Risk] Filling mitigation plan`);
-    await page.evaluate(() => {
-      const input = document.querySelector('[data-testid="input-risk-mitigation"]') as HTMLTextAreaElement;
-      if (input) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-        if (setter) setter.call(input, '');
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    });
-    await fillInput(page, "input-risk-mitigation", data.mitigationPlan);
-    await page.waitForTimeout(300);
-  }
-}
-
-// ─── CREATE RISK ─────────────────────────────────────────────────────────────
+// ─── Core Risk Creation Logic using Built-in Locators ────────────────────────
 
 async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
   let context: BrowserContext | null = null;
@@ -515,94 +357,206 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     message: "",
     username: input.username,
     riskTitle: input.title,
-    screenshots: {},
+    screenshots: {
+      form_filled: null,
+      success_message: null,
+      risk_in_table: null,
+    },
   };
 
   try {
     const browser = await getBrowser();
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+    });
     context.setDefaultTimeout(config.navigationTimeout);
+
     const page: Page = await context.newPage();
 
-    // Login
-    console.log(`[Create] Logging in as ${input.username}...`);
+    // ── Step 0: Login ──────────────────────────────────────────────────────
+
+    console.log(`[Risk] Logging in as ${input.username}...`);
     const loginSuccess = await performLogin(page, input.username, input.password);
+
     if (!loginSuccess) {
       result.status = "failed";
       result.message = "Login failed — could not authenticate";
       const screenshot = await page.screenshot({ fullPage: true });
-      result.screenshots.failure = await uploadScreenshot(screenshot, "create_login_failed");
+      result.screenshots.form_filled = await uploadScreenshot(screenshot, "login_failed");
       await context.close();
       return result;
     }
-    console.log("[Create] Login successful");
 
-    // Navigate to dashboard
-    console.log("[Create] Navigating to dashboard...");
-    await page.goto(config.dashboardUrl, { waitUntil: "networkidle", timeout: config.navigationTimeout });
+    console.log("[Risk] Login successful");
+
+    // ── Step 1: Navigate to Dashboard ──────────────────────────────────────
+
+    console.log("[Risk] Navigating to dashboard...");
+    await page.goto(config.dashboardUrl, {
+      waitUntil: "networkidle",
+      timeout: config.navigationTimeout,
+    });
     await page.waitForTimeout(3000);
 
-    // Click Add Risk
-    console.log("[Create] Clicking Add Risk...");
+    // ── Step 2: Click "Add Risk" button ────────────────────────────────────
+
+    console.log("[Risk] Clicking Add Risk button...");
     const addRiskBtn = page.getByTestId("button-add-risk");
     await addRiskBtn.waitFor({ state: "visible", timeout: 10000 });
     await addRiskBtn.click();
     await page.waitForTimeout(2000);
 
-    // Fill form
-    await fillRiskForm(page, {
-      title: input.title,
-      description: input.description,
-      category: input.category,
-      status: input.status,
-      impact: input.impact,
-      likelihood: input.likelihood,
-      owner: input.owner,
-      dueDate: input.dueDate,
-      potentialCost: input.potentialCost,
-      mitigationPlan: input.mitigationPlan,
-    });
+    // ── Step 3: Fill Title ─────────────────────────────────────────────────
 
-    // Click Create Risk
-    console.log("[Create] Clicking Create Risk...");
+    console.log("[Risk] Filling title...");
+    await fillInput(page, "input-risk-title", input.title);
+    await page.waitForTimeout(300);
+
+    // ── Step 4: Fill Description ───────────────────────────────────────────
+
+    console.log("[Risk] Filling description...");
+    await fillInput(page, "input-risk-description", input.description);
+    await page.waitForTimeout(300);
+
+    // ── Step 5: Select Category ────────────────────────────────────────────
+
+    console.log(`[Risk] Selecting category: ${input.category}...`);
+    await selectDropdown(page, "select-risk-category", input.category);
+
+    // ── Step 6: Select Status ──────────────────────────────────────────────
+
+    console.log(`[Risk] Selecting status: ${input.status}...`);
+    await selectDropdown(page, "select-risk-status", input.status);
+
+    // ── Step 7: Select Impact ──────────────────────────────────────────────
+
+    console.log(`[Risk] Selecting impact: ${input.impact}...`);
+    await selectDropdown(page, "select-risk-impact", input.impact);
+
+    // ── Step 8: Select Likelihood ──────────────────────────────────────────
+
+    console.log(`[Risk] Selecting likelihood: ${input.likelihood}...`);
+    await selectDropdown(page, "select-risk-likelihood", input.likelihood);
+
+    // ── Step 9: Fill Owner ─────────────────────────────────────────────────
+
+    console.log(`[Risk] Filling owner: ${input.owner}...`);
+    await fillInput(page, "input-risk-owner", input.owner);
+    await page.waitForTimeout(300);
+
+    // ── Step 10: Set Due Date ──────────────────────────────────────────────
+
+    if (input.dueDate) {
+      console.log(`[Risk] Setting due date: ${input.dueDate}...`);
+      await setDueDate(page, input.dueDate);
+    }
+
+    // ── Step 11: Fill Potential Cost ───────────────────────────────────────
+
+    console.log(`[Risk] Filling potential cost: ${input.potentialCost}...`);
+    await fillInput(page, "input-risk-potential-cost", input.potentialCost);
+    await page.waitForTimeout(300);
+
+    // ── Step 12: Fill Mitigation Plan ──────────────────────────────────────
+
+    console.log(`[Risk] Filling mitigation plan...`);
+    await fillInput(page, "input-risk-mitigation", input.mitigationPlan);
+    await page.waitForTimeout(300);
+
+    // ── Step 13: Click "Create Risk" ───────────────────────────────────────
+
+    console.log("[Risk] Clicking Create Risk button...");
     const saveBtn = page.getByTestId("button-save-risk");
     await saveBtn.waitFor({ state: "visible", timeout: 5000 });
     await saveBtn.click();
 
-    // Detect toast
-    let successDetected = await detectToast(page, "Risk created successfully");
+    // ── Step 14: Detect success message — check immediately, toast disappears fast
 
-    // Fallback: check table
+    console.log("[Risk] Watching for success message...");
+
+    // Poll for toast every 500ms for up to 5 seconds
+    let successDetected = false;
+    for (let i = 0; i < 10; i++) {
+      await page.waitForTimeout(500);
+
+      const found = await page.evaluate(() => {
+        const body = document.body.innerText.toLowerCase();
+        return (
+          body.includes("risk created successfully") ||
+          body.includes("created successfully") ||
+          body.includes("success")
+        );
+      });
+
+      if (found) {
+        successDetected = true;
+        console.log(`[Risk] Success toast detected after ${(i + 1) * 500}ms`);
+        break;
+      }
+    }
+
+    // Fallback: if toast missed, check if risk appears in the table
     if (!successDetected) {
-      console.log("[Create] Toast missed — checking table...");
+      console.log("[Risk] Toast not detected — falling back to table verification...");
       await page.waitForTimeout(2000);
-      successDetected = await page.evaluate((title) => document.body.innerText.includes(title), input.title);
+
+      const riskInTable = await page.evaluate((title) => {
+        const body = document.body.innerText;
+        return body.includes(title);
+      }, input.title);
+
+      if (riskInTable) {
+        successDetected = true;
+        console.log("[Risk] Risk found in table — creation confirmed via fallback");
+      }
     }
 
     if (!successDetected) {
+      // Both checks failed — capture screenshot for debugging
+      console.log("[Risk] FAILED — neither toast nor table confirmed risk creation");
       const failScreenshot = await page.screenshot({ fullPage: true });
-      result.screenshots.failure = await uploadScreenshot(failScreenshot, "create_failed");
+      result.screenshots.form_filled = await uploadScreenshot(failScreenshot, "create_risk_failed");
       result.status = "failed";
       result.message = "Risk creation failed — success message not detected and risk not found in table";
       await context.close();
       return result;
     }
 
-    result.status = "success";
-    result.message = "Risk created successfully";
-    console.log("[Create] Risk created successfully!");
+    // ── Step 15: Final table verification ──────────────────────────────────
+
+    await page.waitForTimeout(2000);
+
+    const riskVisible = await page.evaluate((title) => {
+      return document.body.innerText.includes(title);
+    }, input.title);
+
+    if (riskVisible) {
+      result.status = "success";
+      result.message = "Risk created successfully and visible in table";
+      console.log("[Risk] Risk confirmed in table!");
+    } else {
+      result.status = "success";
+      result.message = "Risk created successfully — toast confirmed";
+      console.log("[Risk] Toast confirmed, risk may need page refresh to appear in table");
+    }
 
     await context.close();
+    context = null;
+
     return result;
   } catch (error) {
     if (context) {
+      // Capture error screenshot before closing
       try {
         const pages = context.pages();
         if (pages.length > 0) {
-          const errShot = await pages[0].screenshot({ fullPage: true });
-          result.screenshots.failure = await uploadScreenshot(errShot, "create_error");
+          const errorScreenshot = await pages[0].screenshot({ fullPage: true });
+          result.screenshots.form_filled = await uploadScreenshot(errorScreenshot, "error_state");
         }
-      } catch { /* ignore */ }
+      } catch {
+        // Ignore screenshot error
+      }
       await context.close().catch(() => {});
     }
     result.status = "error";
@@ -611,63 +565,81 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
   }
 }
 
-// ─── EDIT RISK ───────────────────────────────────────────────────────────────
+// ─── Express App ─────────────────────────────────────────────────────────────
 
-async function performEditRisk(input: EditRiskInput): Promise<RiskResult> {
-  let context: BrowserContext | null = null;
+const app = express();
 
-  const result: RiskResult = {
-    status: "error",
-    message: "",
+app.use(express.json({ limit: "1mb" }));
+
+// Auth middleware
+function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+  if (!config.apiKey) {
+    next();
+    return;
+  }
+  if (req.headers["x-api-key"] !== config.apiKey) {
+    res.status(401).json({ status: "error", message: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
+// Create risk endpoint
+app.post("/create-risk", authMiddleware, async (req: Request, res: Response) => {
+  const input = req.body as Partial<RiskInput>;
+
+  if (!input.username || !input.password || !input.title) {
+    res.status(400).json({
+      status: "error",
+      message: "Missing required fields: username, password, title",
+    });
+    return;
+  }
+
+  const fullInput: RiskInput = {
     username: input.username,
-    riskTitle: input.searchTitle,
-    screenshots: {},
+    password: input.password,
+    title: input.title,
+    description: input.description || "",
+    category: input.category || "Technical",
+    status: input.status || "Open",
+    impact: input.impact || "3 - Medium",
+    likelihood: input.likelihood || "3 - Medium",
+    owner: input.owner || "",
+    dueDate: input.dueDate || "",
+    potentialCost: input.potentialCost || "",
+    mitigationPlan: input.mitigationPlan || "",
   };
 
-  try {
-    const browser = await getBrowser();
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-    context.setDefaultTimeout(config.navigationTimeout);
-    const page: Page = await context.newPage();
+  const result = await performCreateRisk(fullInput);
+  res.status(result.status === "error" ? 500 : 200).json(result);
+});
 
-    // Login
-    console.log(`[Edit] Logging in as ${input.username}...`);
-    const loginSuccess = await performLogin(page, input.username, input.password);
-    if (!loginSuccess) {
-      result.status = "failed";
-      result.message = "Login failed — could not authenticate";
-      const screenshot = await page.screenshot({ fullPage: true });
-      result.screenshots.failure = await uploadScreenshot(screenshot, "edit_login_failed");
-      await context.close();
-      return result;
-    }
-    console.log("[Edit] Login successful");
+// Health check
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({
+    status: "running",
+    service: "captus-risk-bot",
+    browserConnected: browserInstance?.isConnected() ?? false,
+    timestamp: new Date().toISOString(),
+  });
+});
 
-    // Navigate to dashboard
-    console.log("[Edit] Navigating to dashboard...");
-    await page.goto(config.dashboardUrl, { waitUntil: "networkidle", timeout: config.navigationTimeout });
-    await page.waitForTimeout(3000);
+// ─── Start & Graceful Shutdown ───────────────────────────────────────────────
 
-    // Search for risk
-    await searchRisk(page, input.searchTitle);
+const server = app.listen(config.port, "0.0.0.0", () => {
+  console.log(`Risk Bot running on port ${config.port}`);
+  console.log(`Target: ${config.dashboardUrl}`);
+  console.log(`Screenshots: ${config.supabaseUrl ? "ENABLED" : "DISABLED"}`);
+  console.log(`Auth: ${config.apiKey ? "ENABLED" : "DISABLED"}`);
+});
 
-    // Find and click the edit button for this risk
-    console.log("[Edit] Looking for edit button...");
-    const editButton = await page.evaluate((title) => {
-      // Find the risk row containing the title
-      const allElements = document.querySelectorAll('*');
-      for (const el of allElements) {
-        if (el.textContent?.trim() === title && el.children.length === 0) {
-          // Found the title element — now find the edit button in the same row area
-          const row = el.closest('[class*="card"], [class*="row"], tr, [class*="risk"]') || el.parentElement?.parentElement?.parentElement;
-          if (row) {
-            const editBtn = row.querySelector('[data-testid^="button-edit-heatmap-risk-"]') as HTMLButtonElement;
-            if (editBtn) {
-              editBtn.click();
-              return true;
-            }
-          }
-        }
-      }
-      // Fallback: click any visible edit button (when search returns single result)
-      const editBtns = document.querySelecto
+async function shutdown(): Promise<void> {
+  console.log("\nShutting down...");
+  server.close();
+  await closeBrowser();
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
