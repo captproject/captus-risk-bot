@@ -45,6 +45,11 @@ interface RiskResult {
   message: string;
   username: string;
   riskTitle: string;
+  assertion: {
+    expected: string;
+    actual: string | null;
+    match: boolean;
+  };
   screenshots: {
     failure?: string | null;
     table_issue?: string | null;
@@ -317,25 +322,74 @@ async function searchRisk(page: Page, title: string): Promise<void> {
 
 // ─── Helper: Detect Toast Message ────────────────────────────────────────────
 
-async function detectToast(page: Page, expectedText: string): Promise<boolean> {
+interface ToastResult {
+  detected: boolean;
+  actualText: string | null;
+  expectedText: string;
+  match: boolean;
+}
+
+async function detectToast(page: Page, expectedText: string): Promise<ToastResult> {
   console.log(`[Risk] Watching for toast: "${expectedText}"...`);
+
+  const result: ToastResult = {
+    detected: false,
+    actualText: null,
+    expectedText: expectedText,
+    match: false,
+  };
 
   for (let i = 0; i < 10; i++) {
     await page.waitForTimeout(500);
 
-    const found = await page.evaluate((text) => {
-      const body = document.body.innerText.toLowerCase();
-      return body.includes(text.toLowerCase());
-    }, expectedText);
+    // Capture actual toast text from the UI
+    const toastText = await page.evaluate(() => {
+      // Common toast selectors: shadcn/radix toast, sonner, react-hot-toast
+      const toastSelectors = [
+        '[data-sonner-toast] [data-content]',
+        '[data-sonner-toast]',
+        '[role="status"]',
+        '[data-radix-toast-viewport] > *',
+        '.toast-message',
+        '[class*="toast"] [class*="title"]',
+        '[class*="toast"] [class*="description"]',
+        '[class*="Toastify"]',
+      ];
 
-    if (found) {
-      console.log(`[Risk] Toast detected after ${(i + 1) * 500}ms`);
-      return true;
+      for (const sel of toastSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.textContent?.trim()) {
+          return el.textContent.trim();
+        }
+      }
+
+      // Fallback: search for any element containing "successfully"
+      const allElements = document.querySelectorAll('*');
+      for (const el of allElements) {
+        const text = el.textContent?.trim() || "";
+        const isSmall = el.children.length === 0 || el.children.length <= 2;
+        if (isSmall && text.toLowerCase().includes("successfully") && text.length < 100) {
+          return text;
+        }
+      }
+
+      return null;
+    });
+
+    if (toastText) {
+      result.detected = true;
+      result.actualText = toastText;
+      result.match = toastText.toLowerCase().includes(expectedText.toLowerCase());
+      console.log(`[Risk] Toast captured after ${(i + 1) * 500}ms`);
+      console.log(`[Risk] Expected: "${expectedText}"`);
+      console.log(`[Risk] Actual:   "${toastText}"`);
+      console.log(`[Risk] Match:    ${result.match}`);
+      return result;
     }
   }
 
   console.log("[Risk] Toast not detected within 5 seconds");
-  return false;
+  return result;
 }
 
 // ─── Core Login Logic ────────────────────────────────────────────────────────
@@ -515,6 +569,7 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     message: "",
     username: input.username,
     riskTitle: input.title,
+    assertion: { expected: "Risk created successfully", actual: null, match: false },
     screenshots: {},
   };
 
@@ -569,14 +624,22 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     await saveBtn.waitFor({ state: "visible", timeout: 5000 });
     await saveBtn.click();
 
-    // Detect toast
-    let successDetected = await detectToast(page, "Risk created successfully");
+    // Detect and capture toast
+    const toast = await detectToast(page, "Risk created successfully");
+    result.assertion.actual = toast.actualText;
+    result.assertion.match = toast.match;
+
+    let successDetected = toast.detected;
 
     // Fallback: check table
     if (!successDetected) {
       console.log("[Create] Toast missed — checking table...");
       await page.waitForTimeout(2000);
       successDetected = await page.evaluate((title) => document.body.innerText.includes(title), input.title);
+      if (successDetected) {
+        result.assertion.actual = "Toast missed — risk found in table";
+        result.assertion.match = true;
+      }
     }
 
     if (!successDetected) {
@@ -589,7 +652,7 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
     }
 
     result.status = "success";
-    result.message = "Risk created successfully";
+    result.message = toast.actualText || "Risk created — toast missed but confirmed in table";
     console.log("[Create] Risk created successfully!");
 
     await context.close();
@@ -621,6 +684,7 @@ async function performEditRisk(input: EditRiskInput): Promise<RiskResult> {
     message: "",
     username: input.username,
     riskTitle: input.searchTitle,
+    assertion: { expected: "Risk updated successfully", actual: null, match: false },
     screenshots: {},
   };
 
@@ -710,14 +774,22 @@ async function performEditRisk(input: EditRiskInput): Promise<RiskResult> {
     await updateBtn.waitFor({ state: "visible", timeout: 5000 });
     await updateBtn.click();
 
-    // Detect toast
-    let successDetected = await detectToast(page, "Risk updated successfully");
+    // Detect and capture toast
+    const toast = await detectToast(page, "Risk updated successfully");
+    result.assertion.actual = toast.actualText;
+    result.assertion.match = toast.match;
+
+    let successDetected = toast.detected;
 
     // Fallback: check for updated title in table
     if (!successDetected && input.newTitle) {
       console.log("[Edit] Toast missed — checking table for updated title...");
       await page.waitForTimeout(2000);
       successDetected = await page.evaluate((title) => document.body.innerText.includes(title), input.newTitle);
+      if (successDetected) {
+        result.assertion.actual = "Toast missed — updated risk found in table";
+        result.assertion.match = true;
+      }
     }
 
     if (!successDetected) {
@@ -730,7 +802,7 @@ async function performEditRisk(input: EditRiskInput): Promise<RiskResult> {
     }
 
     result.status = "success";
-    result.message = "Risk updated successfully";
+    result.message = toast.actualText || "Risk updated — toast missed but confirmed in table";
     result.riskTitle = input.newTitle || input.searchTitle;
     console.log("[Edit] Risk updated successfully!");
 
@@ -763,6 +835,7 @@ async function performDeleteRisk(input: DeleteRiskInput): Promise<RiskResult> {
     message: "",
     username: input.username,
     riskTitle: input.searchTitle,
+    assertion: { expected: "Risk deleted successfully", actual: null, match: false },
     screenshots: {},
   };
 
@@ -848,19 +921,24 @@ async function performDeleteRisk(input: DeleteRiskInput): Promise<RiskResult> {
       return result;
     }
 
-    // Detect toast
-    let successDetected = await detectToast(page, "Risk deleted successfully");
+    // Detect and capture toast
+    const toast = await detectToast(page, "Risk deleted successfully");
+    result.assertion.actual = toast.actualText;
+    result.assertion.match = toast.match;
+
+    let successDetected = toast.detected;
 
     // Fallback: verify risk is gone from the table
     if (!successDetected) {
       console.log("[Delete] Toast missed — verifying risk is removed...");
       await page.waitForTimeout(2000);
 
-      // Search again — risk should not appear
       await searchRisk(page, input.searchTitle);
       const stillExists = await page.evaluate((title) => document.body.innerText.includes(title), input.searchTitle);
       if (!stillExists) {
         successDetected = true;
+        result.assertion.actual = "Toast missed — risk confirmed removed from table";
+        result.assertion.match = true;
         console.log("[Delete] Risk confirmed removed from table");
       }
     }
@@ -875,7 +953,7 @@ async function performDeleteRisk(input: DeleteRiskInput): Promise<RiskResult> {
     }
 
     result.status = "success";
-    result.message = "Risk deleted successfully";
+    result.message = toast.actualText || "Risk deleted — toast missed but confirmed removed from table";
     console.log("[Delete] Risk deleted successfully!");
 
     await context.close();
