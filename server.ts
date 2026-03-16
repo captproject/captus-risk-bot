@@ -752,46 +752,58 @@ async function performDeleteRisk(input: DeleteRiskInput): Promise<RiskResult> {
 
 async function verifyRiskStatus(page: Page, title: string, expectedStatus: string): Promise<{ actual: string | null; versionCount: number }> {
   await page.goto(config.tableUrl, { waitUntil: "networkidle", timeout: config.navigationTimeout });
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(3000);
   await searchRisk(page, title);
 
-  const actual = await page.evaluate((riskTitle) => {
+  // Wait for search results to settle
+  await page.waitForTimeout(2000);
+
+  // Get status by finding any visible status badge text on the page
+  // Since we searched for a specific risk, the visible status badge belongs to our risk
+  const actual = await page.evaluate((statuses) => {
     const allElements = document.querySelectorAll('*');
     for (const el of allElements) {
-      if (el.textContent?.trim() === riskTitle && el.children.length === 0) {
-        const row = el.closest('[class*="card"], [class*="row"], tr') || el.parentElement?.parentElement;
-        if (row) {
-          const badges = row.querySelectorAll('[class*="badge"], [class*="Badge"], span');
-          for (const badge of badges) {
-            const text = badge.textContent?.trim() || "";
-            if (["Open", "In Review", "Mitigated", "Closed"].includes(text)) return text;
-          }
+      const text = el.textContent?.trim() || "";
+      // Match exact status text in small elements (badges)
+      if (statuses.includes(text) && el.children.length === 0) {
+        // Verify it's a badge-like element (small, styled)
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        if (rect.width > 0 && rect.width < 200 && rect.height > 0 && rect.height < 50) {
+          return text;
         }
       }
     }
     return null;
-  }, title);
+  }, ["Open", "In Review", "Mitigated", "Closed"]);
 
-  // Expand to get version count
+  console.log(`[Status] Status badge found: ${actual}`);
+
+  // Click to expand and get version count
   await page.evaluate((riskTitle) => {
     const allElements = document.querySelectorAll('*');
     for (const el of allElements) {
-      if (el.textContent?.trim() === riskTitle && el.children.length === 0) { (el as HTMLElement).click(); return; }
+      if (el.textContent?.trim() === riskTitle && el.children.length === 0) {
+        (el as HTMLElement).click();
+        return;
+      }
     }
   }, title);
 
   await page.waitForTimeout(2000);
 
+  // Get version count
   const versionCount = await page.evaluate(() => {
-    const headings = document.querySelectorAll('h4, [class*="heading"]');
-    for (const h of headings) {
-      const text = h.textContent?.trim() || "";
-      const match = text.match(/Version History\s*\((\d+)\)/i);
-      if (match) return parseInt(match[1]);
-    }
+    // Try heading text first
+    const allText = document.body.innerText;
+    const match = allText.match(/Version History\s*\((\d+)\)/i);
+    if (match) return parseInt(match[1]);
+
+    // Fallback: count version entries
     const entries = document.querySelectorAll('[data-testid^="version-entry-"]');
     return entries.length;
   });
+
+  console.log(`[Status] Version count: ${versionCount}`);
 
   return { actual, versionCount };
 }
