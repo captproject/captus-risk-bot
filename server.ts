@@ -1,5 +1,5 @@
 import express, { Request, Response, NextFunction } from "express";
-import { chromium, Browser, BrowserContext, Page } from "playwright";
+import { chromium, Browser, BrowserContext, Page, Route } from "playwright";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -119,6 +119,7 @@ interface Config {
   supabaseKey: string;
   port: number;
   navigationTimeout: number;
+  executionTimeout: number;
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -132,6 +133,7 @@ const config: Config = {
   supabaseKey: process.env.SUPABASE_KEY || "",
   port: Number(process.env.PORT) || 3000,
   navigationTimeout: 60_000,
+  executionTimeout: 120_000, // 2 min max per test execution
 };
 
 const KNOWN_STATUSES = ["Open", "In Review", "Mitigated", "Closed"] as const;
@@ -145,8 +147,15 @@ const MONTH_NAMES = [
   "July", "August", "September", "October", "November", "December",
 ];
 
+// Resource types to block — saves ~30-80 MB per page load
+const BLOCKED_RESOURCE_TYPES = ["image", "media", "font", "stylesheet"];
+const BLOCKED_URL_PATTERNS = [
+  "google-analytics.com", "googletagmanager.com", "facebook.net",
+  "hotjar.com", "intercom.io", "sentry.io", "mixpanel.com",
+  "segment.io", "amplitude.com", "clarity.ms",
+];
+
 // ─── Execution Queue (Single Concurrency) ────────────────────────────────────
-// Ensures only ONE Playwright execution runs at a time to prevent memory stacking.
 
 class ExecutionQueue {
   private queue: Array<{
@@ -194,6 +203,27 @@ class ExecutionQueue {
 
 const executionQueue = new ExecutionQueue();
 
+// ─── Timeout Guard ───────────────────────────────────────────────────────────
+// Wraps any async function with a max execution time. Kills stuck tests.
+
+function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`[Timeout] ${label} exceeded ${timeoutMs / 1000}s limit — killed`));
+    }, timeoutMs);
+
+    fn()
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 // ─── Browser Pool (Reused Instance + Aggressive Flags) ───────────────────────
 
 let browserInstance: Browser | null = null;
@@ -210,28 +240,28 @@ async function getBrowser(): Promise<Browser> {
       "--disable-setuid-sandbox",
 
       // ── Memory reduction flags ──
-      "--disable-dev-shm-usage",          // Use /tmp instead of shared memory
-      "--disable-gpu",                     // No GPU compositing
-      "--disable-software-rasterizer",     // Disable fallback rasterizer
-      "--single-process",                  // Run browser in single process (~50-80MB saved)
-      "--no-zygote",                       // Skip zygote process (~20-30MB saved)
-      "--disable-extensions",              // No extension subsystem
-      "--disable-background-networking",   // No background network requests
-      "--disable-default-apps",            // No default app installation
-      "--disable-sync",                    // No sync services
-      "--disable-translate",               // No translation service
-      "--disable-notifications",           // No notification subsystem
-      "--disable-component-update",        // No component updater
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--single-process",
+      "--no-zygote",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--disable-translate",
+      "--disable-notifications",
+      "--disable-component-update",
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
       "--disable-renderer-backgrounding",
       "--disable-ipc-flooding-protection",
 
       // ── Rendering optimizations ──
-      "--disable-canvas-aa",               // No canvas anti-aliasing
-      "--disable-2d-canvas-clip-aa",       // No 2D canvas clip anti-aliasing
-      "--disable-accelerated-2d-canvas",   // Software 2D canvas
-      "--disable-web-security",            // Skip CORS (safe for testing)
+      "--disable-canvas-aa",
+      "--disable-2d-canvas-clip-aa",
+      "--disable-accelerated-2d-canvas",
+      "--disable-web-security",
       "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process",
 
       // ── JS engine memory limits ──
@@ -263,6 +293,93 @@ async function closeBrowser(): Promise<void> {
     browserInstance = null;
     console.log("[Browser] Closed and memory released");
   }
+}
+
+// ─── Session Reuse ───────────────────────────────────────────────────────────
+// Caches login sessions per username to avoid repeated login overhead.
+// Auto-refreshes if the session becomes stale.
+
+interface CachedSession {
+  cookies: any[];
+  localStorage: Record<string, string>;
+  username: string;
+  loginTime: number;
+}
+
+const SESSION_TTL = 5 * 60 * 1000; // 5 minutes — sessions expire after this
+let cachedSession: CachedSession | null = null;
+
+async function saveSession(context: BrowserContext, username: string): Promise<void> {
+  try {
+    const cookies = await context.cookies();
+    const pages = context.pages();
+    let localStorage: Record<string, string> = {};
+    if (pages.length > 0) {
+      localStorage = await pages[0].evaluate(() => {
+        const data: Record<string, string> = {};
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const key = window.localStorage.key(i);
+          if (key) data[key] = window.localStorage.getItem(key) || "";
+        }
+        return data;
+      }).catch(() => ({}));
+    }
+    cachedSession = { cookies, localStorage, username, loginTime: Date.now() };
+    console.log(`[Session] Saved session for ${username} (${cookies.length} cookies)`);
+  } catch (err) {
+    console.log(`[Session] Failed to save: ${(err as Error).message}`);
+  }
+}
+
+async function restoreSession(context: BrowserContext, username: string): Promise<boolean> {
+  if (!cachedSession) return false;
+  if (cachedSession.username !== username) return false;
+  if (Date.now() - cachedSession.loginTime > SESSION_TTL) {
+    console.log("[Session] Expired — will re-login");
+    cachedSession = null;
+    return false;
+  }
+
+  try {
+    await context.addCookies(cachedSession.cookies);
+    console.log(`[Session] Restored session for ${username}`);
+    return true;
+  } catch (err) {
+    console.log(`[Session] Restore failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+function invalidateSession(): void {
+  cachedSession = null;
+  console.log("[Session] Invalidated");
+}
+
+// ─── Resource Blocking ───────────────────────────────────────────────────────
+// Blocks images, fonts, media, stylesheets, and tracking scripts to save memory.
+
+async function enableResourceBlocking(context: BrowserContext): Promise<void> {
+  await context.route("**/*", (route: Route) => {
+    const request = route.request();
+    const resourceType = request.resourceType();
+    const url = request.url();
+
+    // Block heavy resource types
+    if (BLOCKED_RESOURCE_TYPES.includes(resourceType)) {
+      route.abort().catch(() => {});
+      return;
+    }
+
+    // Block known tracking/analytics scripts
+    if (BLOCKED_URL_PATTERNS.some((pattern) => url.includes(pattern))) {
+      route.abort().catch(() => {});
+      return;
+    }
+
+    route.continue().catch(() => {});
+  });
+
+  console.log("[Resources] Blocking images, fonts, media, stylesheets, and trackers");
 }
 
 // ─── Screenshot Upload ───────────────────────────────────────────────────────
@@ -317,6 +434,30 @@ async function safeClose(context: BrowserContext | null): Promise<void> {
   if (context) {
     await context.close().catch(() => {});
   }
+}
+
+// ─── Helper: Retry wrapper ───────────────────────────────────────────────────
+// Retries an async function up to maxAttempts times with delay between attempts.
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxAttempts: number = 3,
+  delayMs: number = 2_000,
+): Promise<T> {
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err as Error;
+      console.log(`[Retry] ${label} — attempt ${attempt}/${maxAttempts} failed: ${lastError.message}`);
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastError;
 }
 
 // ─── Helper: Select Dropdown ─────────────────────────────────────────────────
@@ -552,40 +693,91 @@ async function fillRiskForm(
   }
 }
 
-// ─── Core Login ──────────────────────────────────────────────────────────────
+// ─── Core Login (with retry) ─────────────────────────────────────────────────
 
 async function performLogin(page: Page, username: string, password: string): Promise<boolean> {
-  try {
-    await page.goto(config.loginUrl, { waitUntil: "networkidle", timeout: config.navigationTimeout });
+  return withRetry(
+    async () => {
+      await page.goto(config.loginUrl, { waitUntil: "networkidle", timeout: config.navigationTimeout });
 
-    const emailInput = page.locator('input[name="email"]');
-    await emailInput.waitFor({ state: "visible", timeout: 15_000 });
-    await emailInput.fill(username);
+      const emailInput = page.locator('input[name="email"]');
+      await emailInput.waitFor({ state: "visible", timeout: 15_000 });
+      await emailInput.fill(username);
 
-    const passwordInput = page.locator('input[name="password"]');
-    await passwordInput.waitFor({ state: "visible", timeout: 5_000 });
-    await passwordInput.fill(password);
+      const passwordInput = page.locator('input[name="password"]');
+      await passwordInput.waitFor({ state: "visible", timeout: 5_000 });
+      await passwordInput.fill(password);
 
-    const loginBtn = page.getByTestId("button-login");
-    await loginBtn.waitFor({ state: "visible", timeout: 5_000 });
-    await loginBtn.click();
+      const loginBtn = page.getByTestId("button-login");
+      await loginBtn.waitFor({ state: "visible", timeout: 5_000 });
+      await loginBtn.click();
 
-    await page.waitForURL((url) => !url.pathname.includes("/login"), { timeout: 15_000 }).catch(() => {});
+      await page.waitForURL((url) => !url.pathname.includes("/login"), { timeout: 15_000 }).catch(() => {});
 
-    const loggedIn = !page.url().includes("/login");
-    console.log(`[Login] ${loggedIn ? "Success" : "Failed"} — URL: ${page.url()}`);
-    return loggedIn;
-  } catch (err) {
-    console.error(`[Login] Error: ${(err as Error).message}`);
-    return false;
-  }
+      const loggedIn = !page.url().includes("/login");
+      console.log(`[Login] ${loggedIn ? "Success" : "Failed"} — URL: ${page.url()}`);
+
+      if (!loggedIn) {
+        throw new Error("Login failed — still on /login page");
+      }
+      return true;
+    },
+    "Login",
+    3,    // max 3 attempts
+    2_000 // 2s delay between retries
+  ).catch(() => false);
 }
 
-// ─── Helper: Navigate and wait ───────────────────────────────────────────────
+// ─── Helper: Login with session reuse ────────────────────────────────────────
+// Tries to restore a cached session first. Falls back to full login if stale.
+
+async function loginWithSession(
+  context: BrowserContext,
+  page: Page,
+  username: string,
+  password: string,
+): Promise<boolean> {
+  // Try restoring cached session
+  const restored = await restoreSession(context, username);
+  if (restored) {
+    // Navigate to dashboard to verify session is still valid
+    try {
+      await page.goto(config.dashboardUrl, { waitUntil: "networkidle", timeout: config.navigationTimeout });
+      await page.waitForTimeout(1_500);
+
+      const onDashboard = !page.url().includes("/login");
+      if (onDashboard) {
+        console.log(`[Session] Reused session for ${username} — skipped login`);
+        return true;
+      }
+      console.log("[Session] Session expired — falling back to login");
+      invalidateSession();
+    } catch {
+      console.log("[Session] Restore navigation failed — falling back to login");
+      invalidateSession();
+    }
+  }
+
+  // Full login with retry
+  const loggedIn = await performLogin(page, username, password);
+  if (loggedIn) {
+    await saveSession(context, username);
+  }
+  return loggedIn;
+}
+
+// ─── Helper: Navigate with retry ─────────────────────────────────────────────
 
 async function navigateTo(page: Page, url: string): Promise<void> {
-  await page.goto(url, { waitUntil: "networkidle", timeout: config.navigationTimeout });
-  await page.waitForTimeout(2_000);
+  await withRetry(
+    async () => {
+      await page.goto(url, { waitUntil: "networkidle", timeout: config.navigationTimeout });
+      await page.waitForTimeout(2_000);
+    },
+    `Navigate to ${url}`,
+    2,    // max 2 attempts
+    1_500 // 1.5s delay
+  );
 }
 
 // ─── Helper: Click edit button ───────────────────────────────────────────────
@@ -614,6 +806,16 @@ async function riskVisibleInPage(page: Page, title: string): Promise<boolean> {
   }
 }
 
+// ─── Helper: Create optimized context ────────────────────────────────────────
+// Creates a browser context with resource blocking enabled.
+
+async function createOptimizedContext(browser: Browser): Promise<BrowserContext> {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  context.setDefaultTimeout(config.navigationTimeout);
+  await enableResourceBlocking(context);
+  return context;
+}
+
 // ─── CREATE RISK ─────────────────────────────────────────────────────────────
 
 async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
@@ -629,14 +831,13 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
 
   try {
     const browser = await getBrowser();
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-    context.setDefaultTimeout(config.navigationTimeout);
+    context = await createOptimizedContext(browser);
     const page = await context.newPage();
 
     console.log(`[Create] Logging in as ${input.username}`);
-    if (!(await performLogin(page, input.username, input.password))) {
+    if (!(await loginWithSession(context, page, input.username, input.password))) {
       result.status = "failed";
-      result.message = "Login failed";
+      result.message = "Login failed after 3 retries";
       const s = await page.screenshot({ fullPage: true });
       result.screenshots.failure = await uploadScreenshot(s, "create_login_failed");
       return result;
@@ -708,14 +909,13 @@ async function performEditRisk(input: EditRiskInput): Promise<RiskResult> {
 
   try {
     const browser = await getBrowser();
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-    context.setDefaultTimeout(config.navigationTimeout);
+    context = await createOptimizedContext(browser);
     const page = await context.newPage();
 
     console.log(`[Edit] Logging in as ${input.username}`);
-    if (!(await performLogin(page, input.username, input.password))) {
+    if (!(await loginWithSession(context, page, input.username, input.password))) {
       result.status = "failed";
-      result.message = "Login failed";
+      result.message = "Login failed after 3 retries";
       const s = await page.screenshot({ fullPage: true });
       result.screenshots.failure = await uploadScreenshot(s, "edit_login_failed");
       return result;
@@ -792,14 +992,13 @@ async function performDeleteRisk(input: DeleteRiskInput): Promise<RiskResult> {
 
   try {
     const browser = await getBrowser();
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-    context.setDefaultTimeout(config.navigationTimeout);
+    context = await createOptimizedContext(browser);
     const page = await context.newPage();
 
     console.log(`[Delete] Logging in as ${input.username}`);
-    if (!(await performLogin(page, input.username, input.password))) {
+    if (!(await loginWithSession(context, page, input.username, input.password))) {
       result.status = "failed";
-      result.message = "Login failed";
+      result.message = "Login failed after 3 retries";
       const s = await page.screenshot({ fullPage: true });
       result.screenshots.failure = await uploadScreenshot(s, "delete_login_failed");
       return result;
@@ -949,14 +1148,13 @@ async function performStatusWorkflow(input: StatusWorkflowInput): Promise<Status
 
   try {
     const browser = await getBrowser();
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-    context.setDefaultTimeout(config.navigationTimeout);
+    context = await createOptimizedContext(browser);
     const page = await context.newPage();
 
     console.log(`[Workflow] Logging in as ${input.username}`);
-    if (!(await performLogin(page, input.username, input.password))) {
+    if (!(await loginWithSession(context, page, input.username, input.password))) {
       result.status = "fail";
-      result.message = "Login failed";
+      result.message = "Login failed after 3 retries";
       const s = await page.screenshot({ fullPage: true });
       result.screenshots.failure = await uploadScreenshot(s, "status_login_failed");
       return result;
@@ -1151,14 +1349,13 @@ async function performFilterRisks(input: FilterRiskInput): Promise<FilterRiskRes
 
   try {
     const browser = await getBrowser();
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-    context.setDefaultTimeout(config.navigationTimeout);
+    context = await createOptimizedContext(browser);
     const page = await context.newPage();
 
     console.log(`[Filter] Logging in as ${input.username}`);
-    if (!(await performLogin(page, input.username, input.password))) {
+    if (!(await loginWithSession(context, page, input.username, input.password))) {
       result.status = "fail";
-      result.assertion.actual = "Login failed";
+      result.assertion.actual = "Login failed after 3 retries";
       const s = await page.screenshot({ fullPage: true });
       result.screenshots.failure = await uploadScreenshot(s, "filter_login_failed");
       return result;
@@ -1249,8 +1446,8 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
-// ─── Queued Endpoints ────────────────────────────────────────────────────────
-// All Playwright endpoints go through the execution queue to prevent concurrency.
+// ─── Queued + Timeout-Guarded Endpoints ──────────────────────────────────────
+// All Playwright endpoints go through: queue (single concurrency) → timeout guard.
 
 app.post("/create-risk", authMiddleware, async (req: Request, res: Response) => {
   const input = req.body as Partial<RiskInput>;
@@ -1266,8 +1463,14 @@ app.post("/create-risk", authMiddleware, async (req: Request, res: Response) => 
     dueDate: input.dueDate || "", potentialCost: input.potentialCost || "",
     mitigationPlan: input.mitigationPlan || "",
   };
-  const result = await executionQueue.add(() => performCreateRisk(full));
-  res.status(result.status === "error" ? 500 : 200).json(result);
+  try {
+    const result = await executionQueue.add(() =>
+      withTimeout(() => performCreateRisk(full), config.executionTimeout, "create-risk")
+    );
+    res.status(result.status === "error" ? 500 : 200).json(result);
+  } catch (err) {
+    res.status(500).json({ status: "error", message: (err as Error).message });
+  }
 });
 
 app.post("/edit-risk", authMiddleware, async (req: Request, res: Response) => {
@@ -1276,8 +1479,14 @@ app.post("/edit-risk", authMiddleware, async (req: Request, res: Response) => {
     res.status(400).json({ status: "error", message: "Missing: username, password, searchTitle" });
     return;
   }
-  const result = await executionQueue.add(() => performEditRisk(input as EditRiskInput));
-  res.status(result.status === "error" ? 500 : 200).json(result);
+  try {
+    const result = await executionQueue.add(() =>
+      withTimeout(() => performEditRisk(input as EditRiskInput), config.executionTimeout, "edit-risk")
+    );
+    res.status(result.status === "error" ? 500 : 200).json(result);
+  } catch (err) {
+    res.status(500).json({ status: "error", message: (err as Error).message });
+  }
 });
 
 app.post("/delete-risk", authMiddleware, async (req: Request, res: Response) => {
@@ -1286,8 +1495,14 @@ app.post("/delete-risk", authMiddleware, async (req: Request, res: Response) => 
     res.status(400).json({ status: "error", message: "Missing: username, password, searchTitle" });
     return;
   }
-  const result = await executionQueue.add(() => performDeleteRisk(input as DeleteRiskInput));
-  res.status(result.status === "error" ? 500 : 200).json(result);
+  try {
+    const result = await executionQueue.add(() =>
+      withTimeout(() => performDeleteRisk(input as DeleteRiskInput), config.executionTimeout, "delete-risk")
+    );
+    res.status(result.status === "error" ? 500 : 200).json(result);
+  } catch (err) {
+    res.status(500).json({ status: "error", message: (err as Error).message });
+  }
 });
 
 app.post("/risk-status-workflow", authMiddleware, async (req: Request, res: Response) => {
@@ -1304,8 +1519,15 @@ app.post("/risk-status-workflow", authMiddleware, async (req: Request, res: Resp
     dueDate: input.dueDate || "", potentialCost: input.potentialCost || "",
     mitigationPlan: input.mitigationPlan || "",
   };
-  const result = await executionQueue.add(() => performStatusWorkflow(full));
-  res.status(result.status === "error" ? 500 : 200).json(result);
+  try {
+    // Status workflow is longer — give it 3 min
+    const result = await executionQueue.add(() =>
+      withTimeout(() => performStatusWorkflow(full), 180_000, "risk-status-workflow")
+    );
+    res.status(result.status === "error" ? 500 : 200).json(result);
+  } catch (err) {
+    res.status(500).json({ status: "error", message: (err as Error).message });
+  }
 });
 
 app.post("/filter-risks", authMiddleware, async (req: Request, res: Response) => {
@@ -1314,21 +1536,28 @@ app.post("/filter-risks", authMiddleware, async (req: Request, res: Response) =>
     res.status(400).json({ status: "error", message: "Missing: username, password" });
     return;
   }
-  const result = await executionQueue.add(() => performFilterRisks(input as FilterRiskInput));
-  res.status(result.status === "error" ? 500 : 200).json(result);
+  try {
+    const result = await executionQueue.add(() =>
+      withTimeout(() => performFilterRisks(input as FilterRiskInput), config.executionTimeout, "filter-risks")
+    );
+    res.status(result.status === "error" ? 500 : 200).json(result);
+  } catch (err) {
+    res.status(500).json({ status: "error", message: (err as Error).message });
+  }
 });
 
-// ─── Reset Browser (call from n8n between test suites if needed) ─────────────
+// ─── Reset Browser ───────────────────────────────────────────────────────────
 
 app.post("/reset-browser", authMiddleware, async (_req: Request, res: Response) => {
   await closeBrowser();
+  invalidateSession();
   if (global.gc) {
     global.gc();
     console.log("[Reset] Forced garbage collection");
   }
   res.json({
     status: "ok",
-    message: "Browser closed and memory released",
+    message: "Browser closed, session cleared, memory released",
     timestamp: new Date().toISOString(),
   });
 });
@@ -1345,6 +1574,7 @@ app.get("/health", (_req: Request, res: Response) => {
       "/risk-status-workflow", "/filter-risks", "/reset-browser",
     ],
     browserConnected: browserInstance?.isConnected() ?? false,
+    sessionCached: cachedSession ? cachedSession.username : null,
     queue: {
       running: executionQueue.isRunning,
       pending: executionQueue.pendingCount,
@@ -1367,6 +1597,9 @@ const server = app.listen(config.port, "0.0.0.0", () => {
   console.log(`Screenshots: ${config.supabaseUrl ? "ENABLED" : "DISABLED"}`);
   console.log(`Auth:        ${config.apiKey ? "ENABLED" : "DISABLED"}`);
   console.log(`Queue:       ENABLED (single concurrency)`);
+  console.log(`Timeout:     ${config.executionTimeout / 1000}s per test`);
+  console.log(`Resources:   Blocking images, fonts, media, trackers`);
+  console.log(`Sessions:    Reuse enabled (${SESSION_TTL / 1000}s TTL)`);
 });
 
 async function shutdown(): Promise<void> {
