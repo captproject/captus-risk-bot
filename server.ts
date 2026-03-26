@@ -391,6 +391,34 @@ async function enableResourceBlocking(context: BrowserContext): Promise<void> {
   console.log("[Resources] Blocking images, fonts, media, stylesheets, and trackers");
 }
 
+// ─── Result Storage — Push test results to Supabase ──────────────────────────
+
+async function saveTestResult(table: string, data: Record<string, any>): Promise<void> {
+  if (!config.supabaseUrl || !config.supabaseKey) {
+    console.log("[Result] Supabase not configured — skipping result save");
+    return;
+  }
+  try {
+    const response = await fetch(`${config.supabaseUrl}/rest/v1/${table}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: config.supabaseKey,
+        Authorization: `Bearer ${config.supabaseKey}`,
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({ ...data, executed_at: new Date().toISOString() }),
+    });
+    if (response.ok) {
+      console.log(`[Result] Saved to ${table} successfully`);
+    } else {
+      console.error(`[Result] Failed to save to ${table}: ${await response.text()}`);
+    }
+  } catch (err) {
+    console.error(`[Result] Error saving to ${table}: ${(err as Error).message}`);
+  }
+}
+
 // ─── Screenshot Upload ───────────────────────────────────────────────────────
 
 async function uploadScreenshot(buffer: Buffer, label: string): Promise<string | null> {
@@ -1544,8 +1572,28 @@ app.post("/create-risk", authMiddleware, async (req: Request, res: Response) => 
     const result = await executionQueue.add(() =>
       withTimeout(() => performCreateRisk(full), config.executionTimeout, "create-risk")
     );
+    await saveTestResult("tc_create_risk", {
+      status: result.status,
+      username: result.username,
+      risk_title: result.riskTitle,
+      assertion_expected: result.assertion.expected,
+      assertion_actual: result.assertion.actual,
+      assertion_match: result.assertion.match,
+      screenshot_failure: result.screenshots?.failure || null,
+      message: result.message,
+    });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
+    await saveTestResult("tc_create_risk", {
+      status: "error",
+      username: input.username,
+      risk_title: input.title,
+      assertion_expected: "Risk created successfully",
+      assertion_actual: null,
+      assertion_match: false,
+      screenshot_failure: null,
+      message: (err as Error).message,
+    });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
 });
@@ -1560,8 +1608,30 @@ app.post("/edit-risk", authMiddleware, async (req: Request, res: Response) => {
     const result = await executionQueue.add(() =>
       withTimeout(() => performEditRisk(input as EditRiskInput), config.executionTimeout, "edit-risk")
     );
+    await saveTestResult("tc_edit_risk", {
+      status: result.status,
+      username: result.username,
+      original_title: input.searchTitle,
+      edited_title: result.riskTitle,
+      assertion_expected: result.assertion.expected,
+      assertion_actual: result.assertion.actual,
+      assertion_match: result.assertion.match,
+      screenshot_failure: result.screenshots?.failure || null,
+      message: result.message,
+    });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
+    await saveTestResult("tc_edit_risk", {
+      status: "error",
+      username: input.username,
+      original_title: input.searchTitle,
+      edited_title: null,
+      assertion_expected: "Risk updated successfully",
+      assertion_actual: null,
+      assertion_match: false,
+      screenshot_failure: null,
+      message: (err as Error).message,
+    });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
 });
@@ -1576,8 +1646,28 @@ app.post("/delete-risk", authMiddleware, async (req: Request, res: Response) => 
     const result = await executionQueue.add(() =>
       withTimeout(() => performDeleteRisk(input as DeleteRiskInput), config.executionTimeout, "delete-risk")
     );
+    await saveTestResult("tc_delete_risk", {
+      status: result.status,
+      username: result.username,
+      deleted_title: result.riskTitle,
+      assertion_expected: result.assertion.expected,
+      assertion_actual: result.assertion.actual,
+      assertion_match: result.assertion.match,
+      screenshot_failure: result.screenshots?.failure || null,
+      message: result.message,
+    });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
+    await saveTestResult("tc_delete_risk", {
+      status: "error",
+      username: input.username,
+      deleted_title: input.searchTitle,
+      assertion_expected: "Risk deleted successfully",
+      assertion_actual: null,
+      assertion_match: false,
+      screenshot_failure: null,
+      message: (err as Error).message,
+    });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
 });
@@ -1601,8 +1691,45 @@ app.post("/risk-status-workflow", authMiddleware, async (req: Request, res: Resp
     const result = await executionQueue.add(() =>
       withTimeout(() => performStatusWorkflow(full), 180_000, "risk-status-workflow")
     );
+    const stepMap: Record<string, string | null> = { create: null, in_review: null, mitigated: null, closed: null };
+    for (const s of result.steps) {
+      if (s.step === "create") stepMap.create = s.status;
+      if (s.step === "update_in_review") stepMap.in_review = s.status;
+      if (s.step === "update_mitigated") stepMap.mitigated = s.status;
+      if (s.step === "update_closed") stepMap.closed = s.status;
+    }
+    await saveTestResult("tc_status_workflow", {
+      status: result.status,
+      username: input.username,
+      risk_title: result.riskTitle,
+      expected_flow: result.assertion.expected,
+      actual_flow: result.assertion.actual,
+      flow_match: result.assertion.match,
+      versions_created: result.versions_created,
+      step_create: stepMap.create,
+      step_in_review: stepMap.in_review,
+      step_mitigated: stepMap.mitigated,
+      step_closed: stepMap.closed,
+      screenshot_failure: result.screenshots?.failure || null,
+      message: result.message,
+    });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
+    await saveTestResult("tc_status_workflow", {
+      status: "error",
+      username: input.username,
+      risk_title: input.title,
+      expected_flow: "Open -> In Review -> Mitigated -> Closed",
+      actual_flow: null,
+      flow_match: false,
+      versions_created: 0,
+      step_create: null,
+      step_in_review: null,
+      step_mitigated: null,
+      step_closed: null,
+      screenshot_failure: null,
+      message: (err as Error).message,
+    });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
 });
@@ -1617,8 +1744,34 @@ app.post("/filter-risks", authMiddleware, async (req: Request, res: Response) =>
     const result = await executionQueue.add(() =>
       withTimeout(() => performFilterRisks(input as FilterRiskInput), config.executionTimeout, "filter-risks")
     );
+    await saveTestResult("tc_filter_risk", {
+      status: result.status,
+      username: input.username,
+      filter_status: result.filters.status,
+      filter_category: result.filters.category,
+      assertion_expected: result.assertion.expected,
+      assertion_actual: result.assertion.actual,
+      assertion_match: result.assertion.match,
+      total_rows: result.total_rows,
+      mismatched_count: result.mismatched_rows.length,
+      screenshot_failure: result.screenshots?.failure || null,
+      message: result.assertion.actual,
+    });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
+    await saveTestResult("tc_filter_risk", {
+      status: "error",
+      username: input.username,
+      filter_status: input.statusFilter || "All Status",
+      filter_category: input.categoryFilter || "All",
+      assertion_expected: "All rows match filters",
+      assertion_actual: null,
+      assertion_match: false,
+      total_rows: 0,
+      mismatched_count: 0,
+      screenshot_failure: null,
+      message: (err as Error).message,
+    });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
 });
