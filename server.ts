@@ -702,6 +702,38 @@ async function fillRiskForm(
   }
 }
 
+// ─── Helper: Select Company ──────────────────────────────────────────────────
+// After login, the app lands on /admin/companies with "All Companies" selected.
+// This selects the target company (e.g. "demo") from the company selector dropdown.
+
+async function selectCompany(page: Page, companyName: string = "demo"): Promise<boolean> {
+  try {
+    console.log(`[Company] Selecting company: "${companyName}"`);
+
+    // Click the company selector button
+    const companyBtn = page.getByTestId("button-company-selector");
+    await companyBtn.waitFor({ state: "visible", timeout: 10_000 });
+    await companyBtn.click();
+
+    // Wait for the dropdown menu to appear
+    await page.locator('[role="menuitem"]').first().waitFor({ state: "visible", timeout: 5_000 });
+
+    // Click the target company menuitem by matching text
+    const companyOption = page.locator('[role="menuitem"]').filter({ hasText: companyName }).first();
+    await companyOption.waitFor({ state: "visible", timeout: 5_000 });
+    await companyOption.click();
+
+    // Wait for the menu to close and page to settle
+    await page.waitForTimeout(2_000);
+
+    console.log(`[Company] Selected "${companyName}" successfully`);
+    return true;
+  } catch (err) {
+    console.log(`[Company] Failed to select "${companyName}": ${(err as Error).message}`);
+    return false;
+  }
+}
+
 // ─── Core Login (with retry) ─────────────────────────────────────────────────
 
 async function performLogin(page: Page, username: string, password: string): Promise<boolean> {
@@ -756,6 +788,13 @@ async function loginWithSession(
       // Session is valid if we're NOT on the login page
       const onLogin = page.url().includes("/login");
       if (!onLogin) {
+        // Check if company is already selected (not showing "All Companies")
+        const companyBtn = page.getByTestId("button-company-selector");
+        const btnText = await companyBtn.textContent().catch(() => "");
+        if (btnText?.includes("All Companies")) {
+          console.log("[Session] Company not selected — selecting demo");
+          await selectCompany(page, "demo");
+        }
         console.log(`[Session] Reused session for ${username} — skipped login`);
         return true;
       }
@@ -770,9 +809,13 @@ async function loginWithSession(
   // Full login with retry
   const loggedIn = await performLogin(page, username, password);
   if (loggedIn) {
-    // After login, app may redirect to /admin/companies or elsewhere
-    // We just need to confirm we're off /login — navigation to specific pages happens later
+    // After login, app lands on /admin/companies with "All Companies"
+    // Select "demo" company before proceeding
     console.log(`[Login] Post-login URL: ${page.url()}`);
+    const companySelected = await selectCompany(page, "demo");
+    if (!companySelected) {
+      console.log("[Login] WARNING: Could not select company — proceeding anyway");
+    }
     await saveSession(context, username);
   }
   return loggedIn;
