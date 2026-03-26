@@ -229,6 +229,13 @@ function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, label: string):
 let browserInstance: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
+  // Force cleanup if browser exists but is disconnected
+  if (browserInstance && !browserInstance.isConnected()) {
+    console.log("[Browser] Found stale instance — cleaning up");
+    browserInstance = null;
+    invalidateSession();
+  }
+
   if (browserInstance?.isConnected()) return browserInstance;
 
   console.log("[Browser] Launching with memory-optimized flags");
@@ -243,7 +250,6 @@ async function getBrowser(): Promise<Browser> {
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-software-rasterizer",
-      "--single-process",
       "--no-zygote",
       "--disable-extensions",
       "--disable-background-networking",
@@ -280,8 +286,9 @@ async function getBrowser(): Promise<Browser> {
   });
 
   browserInstance.on("disconnected", () => {
-    console.log("[Browser] Disconnected — will relaunch on next request");
+    console.log("[Browser] Disconnected — clearing instance and session");
     browserInstance = null;
+    invalidateSession();
   });
 
   return browserInstance;
@@ -809,11 +816,33 @@ async function riskVisibleInPage(page: Page, title: string): Promise<boolean> {
 // ─── Helper: Create optimized context ────────────────────────────────────────
 // Creates a browser context with resource blocking enabled.
 
-async function createOptimizedContext(browser: Browser): Promise<BrowserContext> {
-  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-  context.setDefaultTimeout(config.navigationTimeout);
-  await enableResourceBlocking(context);
-  return context;
+async function createOptimizedContext(): Promise<{ browser: Browser; context: BrowserContext }> {
+  let attempts = 0;
+  const maxAttempts = 2;
+
+  while (attempts < maxAttempts) {
+    attempts++;
+    try {
+      const browser = await getBrowser();
+      const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+      context.setDefaultTimeout(config.navigationTimeout);
+      await enableResourceBlocking(context);
+
+      // Verify the context is actually usable by creating a test page
+      const testPage = await context.newPage();
+      // If we got here, the browser + context are healthy
+      return { browser, context };
+    } catch (err) {
+      console.log(`[Context] Creation failed (attempt ${attempts}/${maxAttempts}): ${(err as Error).message}`);
+      // Force kill and retry
+      await closeBrowser();
+      invalidateSession();
+      if (attempts >= maxAttempts) throw err;
+      console.log("[Context] Retrying with fresh browser...");
+    }
+  }
+
+  throw new Error("Failed to create browser context after retries");
 }
 
 // ─── CREATE RISK ─────────────────────────────────────────────────────────────
@@ -830,9 +859,9 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
   };
 
   try {
-    const browser = await getBrowser();
-    context = await createOptimizedContext(browser);
-    const page = await context.newPage();
+    const { context: ctx } = await createOptimizedContext();
+    context = ctx;
+    const page = context.pages()[0]; // reuse the page created during context validation
 
     console.log(`[Create] Logging in as ${input.username}`);
     if (!(await loginWithSession(context, page, input.username, input.password))) {
@@ -908,9 +937,9 @@ async function performEditRisk(input: EditRiskInput): Promise<RiskResult> {
   };
 
   try {
-    const browser = await getBrowser();
-    context = await createOptimizedContext(browser);
-    const page = await context.newPage();
+    const { context: ctx } = await createOptimizedContext();
+    context = ctx;
+    const page = context.pages()[0];
 
     console.log(`[Edit] Logging in as ${input.username}`);
     if (!(await loginWithSession(context, page, input.username, input.password))) {
@@ -991,9 +1020,9 @@ async function performDeleteRisk(input: DeleteRiskInput): Promise<RiskResult> {
   };
 
   try {
-    const browser = await getBrowser();
-    context = await createOptimizedContext(browser);
-    const page = await context.newPage();
+    const { context: ctx } = await createOptimizedContext();
+    context = ctx;
+    const page = context.pages()[0];
 
     console.log(`[Delete] Logging in as ${input.username}`);
     if (!(await loginWithSession(context, page, input.username, input.password))) {
@@ -1147,9 +1176,9 @@ async function performStatusWorkflow(input: StatusWorkflowInput): Promise<Status
   };
 
   try {
-    const browser = await getBrowser();
-    context = await createOptimizedContext(browser);
-    const page = await context.newPage();
+    const { context: ctx } = await createOptimizedContext();
+    context = ctx;
+    const page = context.pages()[0];
 
     console.log(`[Workflow] Logging in as ${input.username}`);
     if (!(await loginWithSession(context, page, input.username, input.password))) {
@@ -1348,9 +1377,9 @@ async function performFilterRisks(input: FilterRiskInput): Promise<FilterRiskRes
   };
 
   try {
-    const browser = await getBrowser();
-    context = await createOptimizedContext(browser);
-    const page = await context.newPage();
+    const { context: ctx } = await createOptimizedContext();
+    context = ctx;
+    const page = context.pages()[0];
 
     console.log(`[Filter] Logging in as ${input.username}`);
     if (!(await loginWithSession(context, page, input.username, input.password))) {
