@@ -147,12 +147,14 @@ const MONTH_NAMES = [
   "July", "August", "September", "October", "November", "December",
 ];
 
-// Resource types to block — saves ~30-80 MB per page load
-const BLOCKED_RESOURCE_TYPES = ["image", "media", "font", "stylesheet"];
+// Resource types to block — saves ~30-50 MB per page load
+// NOTE: stylesheets are NOT blocked — they are required for SPA components to render visible
+const BLOCKED_RESOURCE_TYPES = ["image", "media", "font"];
 const BLOCKED_URL_PATTERNS = [
   "google-analytics.com", "googletagmanager.com", "facebook.net",
   "hotjar.com", "intercom.io", "sentry.io", "mixpanel.com",
   "segment.io", "amplitude.com", "clarity.ms",
+  "cdn.gpteng.co", "replit-cdn.com",
 ];
 
 // ─── Execution Queue (Single Concurrency) ────────────────────────────────────
@@ -747,13 +749,13 @@ async function loginWithSession(
   // Try restoring cached session
   const restored = await restoreSession(context, username);
   if (restored) {
-    // Navigate to dashboard to verify session is still valid
     try {
       await page.goto(config.dashboardUrl, { waitUntil: "networkidle", timeout: config.navigationTimeout });
       await page.waitForTimeout(1_500);
 
-      const onDashboard = !page.url().includes("/login");
-      if (onDashboard) {
+      // Session is valid if we're NOT on the login page
+      const onLogin = page.url().includes("/login");
+      if (!onLogin) {
         console.log(`[Session] Reused session for ${username} — skipped login`);
         return true;
       }
@@ -768,6 +770,9 @@ async function loginWithSession(
   // Full login with retry
   const loggedIn = await performLogin(page, username, password);
   if (loggedIn) {
+    // After login, app may redirect to /admin/companies or elsewhere
+    // We just need to confirm we're off /login — navigation to specific pages happens later
+    console.log(`[Login] Post-login URL: ${page.url()}`);
     await saveSession(context, username);
   }
   return loggedIn;
