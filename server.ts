@@ -393,13 +393,39 @@ async function enableResourceBlocking(context: BrowserContext): Promise<void> {
 
 // ─── Result Storage — Push test results to Supabase ──────────────────────────
 
-async function saveTestResult(table: string, data: Record<string, any>): Promise<void> {
+async function saveTestResult(
+  workflowName: string,
+  common: {
+    status: string;
+    username: string;
+    risk_title?: string | null;
+    message?: string | null;
+    assertion_expected?: string | null;
+    assertion_actual?: string | null;
+    assertion_match?: boolean;
+    screenshot_failure?: string | null;
+  },
+  details: Record<string, any> = {},
+): Promise<void> {
   if (!config.supabaseUrl || !config.supabaseKey) {
     console.log("[Result] Supabase not configured — skipping result save");
     return;
   }
   try {
-    const response = await fetch(`${config.supabaseUrl}/rest/v1/${table}`, {
+    const row = {
+      workflow_name: workflowName,
+      status: common.status,
+      username: common.username,
+      risk_title: common.risk_title || null,
+      message: common.message || null,
+      assertion_expected: common.assertion_expected || null,
+      assertion_actual: common.assertion_actual || null,
+      assertion_match: common.assertion_match ?? false,
+      screenshot_failure: common.screenshot_failure || null,
+      details: JSON.stringify(details),
+      executed_at: new Date().toISOString(),
+    };
+    const response = await fetch(`${config.supabaseUrl}/rest/v1/workflow_results`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -407,15 +433,15 @@ async function saveTestResult(table: string, data: Record<string, any>): Promise
         Authorization: `Bearer ${config.supabaseKey}`,
         Prefer: "return=minimal",
       },
-      body: JSON.stringify({ ...data, executed_at: new Date().toISOString() }),
+      body: JSON.stringify(row),
     });
     if (response.ok) {
-      console.log(`[Result] Saved to ${table} successfully`);
+      console.log(`[Result] Saved ${workflowName} to workflow_results`);
     } else {
-      console.error(`[Result] Failed to save to ${table}: ${await response.text()}`);
+      console.error(`[Result] Failed: ${await response.text()}`);
     }
   } catch (err) {
-    console.error(`[Result] Error saving to ${table}: ${(err as Error).message}`);
+    console.error(`[Result] Error: ${(err as Error).message}`);
   }
 }
 
@@ -1572,27 +1598,25 @@ app.post("/create-risk", authMiddleware, async (req: Request, res: Response) => 
     const result = await executionQueue.add(() =>
       withTimeout(() => performCreateRisk(full), config.executionTimeout, "create-risk")
     );
-    await saveTestResult("tc_create_risk", {
+    await saveTestResult("TC_Create_Risk", {
       status: result.status,
       username: result.username,
       risk_title: result.riskTitle,
+      message: result.message,
       assertion_expected: result.assertion.expected,
       assertion_actual: result.assertion.actual,
       assertion_match: result.assertion.match,
       screenshot_failure: result.screenshots?.failure || null,
-      message: result.message,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
-    await saveTestResult("tc_create_risk", {
+    await saveTestResult("TC_Create_Risk", {
       status: "error",
-      username: input.username,
+      username: input.username!,
       risk_title: input.title,
-      assertion_expected: "Risk created successfully",
-      assertion_actual: null,
-      assertion_match: false,
-      screenshot_failure: null,
       message: (err as Error).message,
+      assertion_expected: "Risk created successfully",
+      assertion_match: false,
     });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
@@ -1608,29 +1632,30 @@ app.post("/edit-risk", authMiddleware, async (req: Request, res: Response) => {
     const result = await executionQueue.add(() =>
       withTimeout(() => performEditRisk(input as EditRiskInput), config.executionTimeout, "edit-risk")
     );
-    await saveTestResult("tc_edit_risk", {
+    await saveTestResult("TC_Edit_Risk", {
       status: result.status,
       username: result.username,
-      original_title: input.searchTitle,
-      edited_title: result.riskTitle,
+      risk_title: result.riskTitle,
+      message: result.message,
       assertion_expected: result.assertion.expected,
       assertion_actual: result.assertion.actual,
       assertion_match: result.assertion.match,
       screenshot_failure: result.screenshots?.failure || null,
-      message: result.message,
+    }, {
+      original_title: input.searchTitle,
+      edited_title: result.riskTitle,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
-    await saveTestResult("tc_edit_risk", {
+    await saveTestResult("TC_Edit_Risk", {
       status: "error",
-      username: input.username,
-      original_title: input.searchTitle,
-      edited_title: null,
-      assertion_expected: "Risk updated successfully",
-      assertion_actual: null,
-      assertion_match: false,
-      screenshot_failure: null,
+      username: input.username!,
+      risk_title: input.searchTitle,
       message: (err as Error).message,
+      assertion_expected: "Risk updated successfully",
+      assertion_match: false,
+    }, {
+      original_title: input.searchTitle,
     });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
@@ -1646,27 +1671,25 @@ app.post("/delete-risk", authMiddleware, async (req: Request, res: Response) => 
     const result = await executionQueue.add(() =>
       withTimeout(() => performDeleteRisk(input as DeleteRiskInput), config.executionTimeout, "delete-risk")
     );
-    await saveTestResult("tc_delete_risk", {
+    await saveTestResult("TC_Delete_Risk", {
       status: result.status,
       username: result.username,
-      deleted_title: result.riskTitle,
+      risk_title: result.riskTitle,
+      message: result.message,
       assertion_expected: result.assertion.expected,
       assertion_actual: result.assertion.actual,
       assertion_match: result.assertion.match,
       screenshot_failure: result.screenshots?.failure || null,
-      message: result.message,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
-    await saveTestResult("tc_delete_risk", {
+    await saveTestResult("TC_Delete_Risk", {
       status: "error",
-      username: input.username,
-      deleted_title: input.searchTitle,
-      assertion_expected: "Risk deleted successfully",
-      assertion_actual: null,
-      assertion_match: false,
-      screenshot_failure: null,
+      username: input.username!,
+      risk_title: input.searchTitle,
       message: (err as Error).message,
+      assertion_expected: "Risk deleted successfully",
+      assertion_match: false,
     });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
@@ -1698,10 +1721,16 @@ app.post("/risk-status-workflow", authMiddleware, async (req: Request, res: Resp
       if (s.step === "update_mitigated") stepMap.mitigated = s.status;
       if (s.step === "update_closed") stepMap.closed = s.status;
     }
-    await saveTestResult("tc_status_workflow", {
+    await saveTestResult("TC_Status_Workflow", {
       status: result.status,
-      username: input.username,
+      username: input.username!,
       risk_title: result.riskTitle,
+      message: result.message,
+      assertion_expected: result.assertion.expected,
+      assertion_actual: result.assertion.actual,
+      assertion_match: result.assertion.match,
+      screenshot_failure: result.screenshots?.failure || null,
+    }, {
       expected_flow: result.assertion.expected,
       actual_flow: result.assertion.actual,
       flow_match: result.assertion.match,
@@ -1710,25 +1739,20 @@ app.post("/risk-status-workflow", authMiddleware, async (req: Request, res: Resp
       step_in_review: stepMap.in_review,
       step_mitigated: stepMap.mitigated,
       step_closed: stepMap.closed,
-      screenshot_failure: result.screenshots?.failure || null,
-      message: result.message,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
-    await saveTestResult("tc_status_workflow", {
+    await saveTestResult("TC_Status_Workflow", {
       status: "error",
-      username: input.username,
+      username: input.username!,
       risk_title: input.title,
+      message: (err as Error).message,
+      assertion_expected: "Open -> In Review -> Mitigated -> Closed",
+      assertion_match: false,
+    }, {
       expected_flow: "Open -> In Review -> Mitigated -> Closed",
       actual_flow: null,
       flow_match: false,
-      versions_created: 0,
-      step_create: null,
-      step_in_review: null,
-      step_mitigated: null,
-      step_closed: null,
-      screenshot_failure: null,
-      message: (err as Error).message,
     });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
