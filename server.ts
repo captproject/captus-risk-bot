@@ -2044,16 +2044,15 @@ app.post("/score-matrix", authMiddleware, async (req: Request, res: Response) =>
       username: result.username,
       risk_title: result.risk_title,
       message: result.message,
-      assertion_expected: `Score = ${result.expected_score}`,
-      assertion_actual: result.actual_score !== null ? `Score = ${result.actual_score}` : null,
-      assertion_match: result.score_match,
+      assertion_expected: `${result.impact} × ${result.likelihood} visible in UI`,
+      assertion_actual: result.risk_visible ? "Visible" : "Not visible",
+      assertion_match: result.risk_visible,
       screenshot_failure: result.screenshots?.failure || null,
     }, {
       impact: result.impact,
       likelihood: result.likelihood,
       expected_score: result.expected_score,
-      actual_score: result.actual_score,
-      score_match: result.score_match,
+      risk_visible: result.risk_visible,
       cleaned_up: result.cleaned_up,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
@@ -2062,7 +2061,7 @@ app.post("/score-matrix", authMiddleware, async (req: Request, res: Response) =>
       status: "error",
       username: input.username!,
       message: (err as Error).message,
-      assertion_expected: `Score = ${input.expectedScore}`,
+      assertion_expected: `${input.impact} × ${input.likelihood} visible in UI`,
       assertion_match: false,
     }, {
       impact: input.impact,
@@ -2098,7 +2097,7 @@ app.get("/health", (_req: Request, res: Response) => {
     service: "captus-risk-bot",
     endpoints: [
       "/create-risk", "/edit-risk", "/delete-risk",
-      "/risk-status-workflow", "/filter-risks", "/reset-browser",
+      "/risk-status-workflow", "/filter-risks", "/score-matrix", "/reset-browser",
     ],
     browserConnected: browserInstance?.isConnected() ?? false,
     sessionCached: cachedSession ? cachedSession.username : null,
