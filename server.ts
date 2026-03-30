@@ -1563,6 +1563,230 @@ async function performFilterRisks(input: FilterRiskInput): Promise<FilterRiskRes
   }
 }
 
+// ─── SCORE MATRIX ────────────────────────────────────────────────────────────
+// Creates a risk with a specific Impact × Likelihood, verifies the score in
+// the table, then deletes the risk. One combination per call.
+
+interface ScoreMatrixInput {
+  username: string;
+  password: string;
+  impact: string;       // e.g. "4 - High"
+  likelihood: string;   // e.g. "5 - Very High"
+  expectedScore: number; // e.g. 20
+}
+
+interface ScoreMatrixResult {
+  status: "pass" | "fail" | "error";
+  message: string;
+  username: string;
+  impact: string;
+  likelihood: string;
+  expected_score: number;
+  actual_score: number | null;
+  score_match: boolean;
+  risk_title: string;
+  cleaned_up: boolean;
+  screenshots: { failure: string | null };
+}
+
+async function readScoreFromTable(page: Page, title: string): Promise<number | null> {
+  return withRetry(
+    async () => {
+      await navigateTo(page, config.tableUrl);
+      await searchRisk(page, title);
+
+      // Wait for table rows to appear
+      await page.waitForTimeout(1_500);
+
+      // Find the row containing our risk title and extract the score
+      const score = await page.evaluate((riskTitle) => {
+        const rows = document.querySelectorAll("tr, [class*='border-b'], [class*='row']");
+        for (const row of rows) {
+          if (!row.textContent?.includes(riskTitle)) continue;
+          // Look for score — it's a number in a colored circle/badge
+          const allElements = row.querySelectorAll("*");
+          for (const el of allElements) {
+            const text = el.textContent?.trim() || "";
+            // Score is a standalone number (1-25) inside a small element
+            if (
+              el.children.length === 0 &&
+              /^\d{1,2}$/.test(text) &&
+              parseInt(text) >= 1 &&
+              parseInt(text) <= 25
+            ) {
+              // Verify it's in the Score column area (not a random number)
+              const rect = el.getBoundingClientRect();
+              if (rect.width > 0 && rect.width < 100) {
+                return parseInt(text);
+              }
+            }
+          }
+        }
+        return null;
+      }, title);
+
+      if (score === null) {
+        throw new Error("Score not found in table");
+      }
+
+      console.log(`[ScoreMatrix] Read score: ${score} for "${title}"`);
+      return score;
+    },
+    "Read score from table",
+    2,    // retry up to 2 times
+    2_000 // 2s delay
+  ).catch(() => null);
+}
+
+async function deleteRiskFromTable(page: Page, title: string): Promise<boolean> {
+  try {
+    await navigateTo(page, config.tableUrl);
+    await searchRisk(page, title);
+
+    // Click the risk row to expand it
+    const riskRow = page.locator("text=" + title).first();
+    await riskRow.waitFor({ state: "visible", timeout: 5_000 });
+    await riskRow.click();
+    await page.waitForTimeout(1_500);
+
+    // Click delete button
+    const deleteBtn = page.locator('[data-testid^="button-delete-risk-"]').first();
+    await deleteBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await deleteBtn.click();
+
+    // Wait for deletion to process
+    const toast = await detectToast(page, "Risk deleted successfully");
+    if (toast.detected) {
+      console.log(`[ScoreMatrix] Cleanup: deleted "${title}"`);
+      return true;
+    }
+
+    // Fallback: verify risk is gone
+    await searchRisk(page, title);
+    const stillExists = await riskVisibleInPage(page, title);
+    return !stillExists;
+  } catch (err) {
+    console.log(`[ScoreMatrix] Cleanup failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+async function performScoreMatrix(input: ScoreMatrixInput): Promise<ScoreMatrixResult> {
+  let context: BrowserContext | null = null;
+  const timestamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 15);
+  const impactShort = input.impact.split(" - ")[1] || input.impact;
+  const likelihoodShort = input.likelihood.split(" - ")[1] || input.likelihood;
+  const riskTitle = `ScoreTest_${impactShort}_${likelihoodShort}_${timestamp}`;
+
+  const result: ScoreMatrixResult = {
+    status: "error",
+    message: "",
+    username: input.username,
+    impact: input.impact,
+    likelihood: input.likelihood,
+    expected_score: input.expectedScore,
+    actual_score: null,
+    score_match: false,
+    risk_title: riskTitle,
+    cleaned_up: false,
+    screenshots: { failure: null },
+  };
+
+  try {
+    const { context: ctx } = await createOptimizedContext();
+    context = ctx;
+    const page = context.pages()[0];
+
+    // Login
+    console.log(`[ScoreMatrix] Testing: ${input.impact} × ${input.likelihood} = ${input.expectedScore}`);
+    if (!(await loginWithSession(context, page, input.username, input.password))) {
+      result.status = "fail";
+      result.message = "Login failed";
+      const s = await page.screenshot({ fullPage: true });
+      result.screenshots.failure = await uploadScreenshot(s, "score_login_failed");
+      return result;
+    }
+
+    // Navigate to table page (which has the + Add Risk button)
+    await navigateTo(page, config.tableUrl);
+
+    // Click "+ Add Risk" button
+    const addBtn = page.locator('text=Add Risk').first();
+    await addBtn.waitFor({ state: "visible", timeout: 10_000 });
+    await addBtn.click();
+    await page.getByTestId("input-risk-title").waitFor({ state: "visible", timeout: 5_000 });
+
+    // Fill minimal form — only title, impact, and likelihood matter
+    await fillRiskForm(page, {
+      title: riskTitle,
+      description: `Score matrix test: ${input.impact} × ${input.likelihood}`,
+      category: "Technical",
+      status: "Open",
+      impact: input.impact,
+      likelihood: input.likelihood,
+    });
+
+    // Save
+    const saveBtn = page.getByTestId("button-save-risk");
+    await saveBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await saveBtn.click();
+
+    // Wait for creation confirmation
+    const toast = await detectToast(page, "Risk created successfully");
+    if (!toast.detected) {
+      const visible = await riskVisibleInPage(page, riskTitle);
+      if (!visible) {
+        result.status = "fail";
+        result.message = "Risk creation failed";
+        const s = await page.screenshot({ fullPage: true });
+        result.screenshots.failure = await uploadScreenshot(s, "score_create_failed");
+        return result;
+      }
+    }
+
+    // Read score from table
+    const actualScore = await readScoreFromTable(page, riskTitle);
+    result.actual_score = actualScore;
+
+    if (actualScore === null) {
+      result.status = "fail";
+      result.message = `Could not read score from table for "${riskTitle}"`;
+      const s = await page.screenshot({ fullPage: true });
+      result.screenshots.failure = await uploadScreenshot(s, "score_read_failed");
+      // Still try to clean up
+      result.cleaned_up = await deleteRiskFromTable(page, riskTitle);
+      return result;
+    }
+
+    // Assert: actual score === expected score
+    result.score_match = actualScore === input.expectedScore;
+
+    if (result.score_match) {
+      result.status = "pass";
+      result.message = `${input.impact} × ${input.likelihood} = ${actualScore} (expected ${input.expectedScore})`;
+      console.log(`[ScoreMatrix] PASS: ${result.message}`);
+    } else {
+      result.status = "fail";
+      result.message = `Score mismatch: got ${actualScore}, expected ${input.expectedScore}`;
+      console.log(`[ScoreMatrix] FAIL: ${result.message}`);
+      const s = await page.screenshot({ fullPage: true });
+      result.screenshots.failure = await uploadScreenshot(s, "score_mismatch");
+    }
+
+    // Cleanup: delete the test risk
+    result.cleaned_up = await deleteRiskFromTable(page, riskTitle);
+
+    return result;
+  } catch (error) {
+    result.screenshots.failure = await captureFailure(context, "score_error");
+    result.status = "error";
+    result.message = (error as Error).message;
+    return result;
+  } finally {
+    await safeClose(context);
+  }
+}
+
 // ─── Express App ─────────────────────────────────────────────────────────────
 
 const app = express();
@@ -1795,6 +2019,55 @@ app.post("/filter-risks", authMiddleware, async (req: Request, res: Response) =>
       mismatched_count: 0,
       screenshot_failure: null,
       message: (err as Error).message,
+    });
+    res.status(500).json({ status: "error", message: (err as Error).message });
+  }
+});
+
+// ─── Reset Browser ───────────────────────────────────────────────────────────
+
+app.post("/score-matrix", authMiddleware, async (req: Request, res: Response) => {
+  const input = req.body as Partial<ScoreMatrixInput>;
+  if (!input.username || !input.password || !input.impact || !input.likelihood || input.expectedScore === undefined) {
+    res.status(400).json({
+      status: "error",
+      message: "Missing: username, password, impact, likelihood, expectedScore",
+    });
+    return;
+  }
+  try {
+    const result = await executionQueue.add(() =>
+      withTimeout(() => performScoreMatrix(input as ScoreMatrixInput), config.executionTimeout, "score-matrix")
+    );
+    await saveTestResult("TC_Score_Matrix", {
+      status: result.status,
+      username: result.username,
+      risk_title: result.risk_title,
+      message: result.message,
+      assertion_expected: `Score = ${result.expected_score}`,
+      assertion_actual: result.actual_score !== null ? `Score = ${result.actual_score}` : null,
+      assertion_match: result.score_match,
+      screenshot_failure: result.screenshots?.failure || null,
+    }, {
+      impact: result.impact,
+      likelihood: result.likelihood,
+      expected_score: result.expected_score,
+      actual_score: result.actual_score,
+      score_match: result.score_match,
+      cleaned_up: result.cleaned_up,
+    });
+    res.status(result.status === "error" ? 500 : 200).json(result);
+  } catch (err) {
+    await saveTestResult("TC_Score_Matrix", {
+      status: "error",
+      username: input.username!,
+      message: (err as Error).message,
+      assertion_expected: `Score = ${input.expectedScore}`,
+      assertion_match: false,
+    }, {
+      impact: input.impact,
+      likelihood: input.likelihood,
+      expected_score: input.expectedScore,
     });
     res.status(500).json({ status: "error", message: (err as Error).message });
   }
