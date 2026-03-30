@@ -2044,15 +2044,14 @@ app.post("/score-matrix", authMiddleware, async (req: Request, res: Response) =>
       username: result.username,
       risk_title: result.risk_title,
       message: result.message,
-      assertion_expected: `${result.impact} × ${result.likelihood} visible in UI`,
-      assertion_actual: result.risk_visible ? "Visible" : "Not visible",
-      assertion_match: result.risk_visible,
+      assertion_expected: "Risk created successfully",
+      assertion_actual: result.status === "pass" ? "Risk created successfully" : result.message,
+      assertion_match: result.status === "pass",
       screenshot_failure: result.screenshots?.failure || null,
     }, {
       impact: result.impact,
       likelihood: result.likelihood,
       expected_score: result.expected_score,
-      risk_visible: result.risk_visible,
       cleaned_up: result.cleaned_up,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
@@ -2061,7 +2060,8 @@ app.post("/score-matrix", authMiddleware, async (req: Request, res: Response) =>
       status: "error",
       username: input.username!,
       message: (err as Error).message,
-      assertion_expected: `${input.impact} × ${input.likelihood} visible in UI`,
+      assertion_expected: "Risk created successfully",
+      assertion_actual: (err as Error).message,
       assertion_match: false,
     }, {
       impact: input.impact,
