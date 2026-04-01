@@ -1072,6 +1072,16 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
       result.message = "Login failed after 3 retries";
       const s = await page.screenshot({ fullPage: true });
       result.screenshots.failure = await uploadScreenshot(s, "create_login_failed");
+      await saveTestResult("TC_Create_Risk", {
+        status: "failed", username: input.username, risk_title: input.title,
+        message: result.message, assertion_expected: "All validations pass",
+        assertion_actual: "Login failed", assertion_match: false,
+        screenshot_failure: result.screenshots.failure,
+      }, {
+        failure_type: "LOGIN_FAILED",
+        checks: { toast_confirmed: false, dashboard_visible: false, table_search: false, fields_valid: false },
+        field_mismatches: [],
+      });
       return result;
     }
 
@@ -1110,6 +1120,16 @@ async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
       result.screenshots.failure = await uploadScreenshot(s, "create_failed");
       result.status = "failed";
       result.message = "Risk creation could not be confirmed";
+      await saveTestResult("TC_Create_Risk", {
+        status: "failed", username: input.username, risk_title: input.title,
+        message: result.message, assertion_expected: "All validations pass",
+        assertion_actual: "Toast not detected, risk not visible", assertion_match: false,
+        screenshot_failure: result.screenshots.failure,
+      }, {
+        failure_type: "CREATE_FAILED",
+        checks: { toast_confirmed: false, dashboard_visible: false, table_search: false, fields_valid: false },
+        field_mismatches: [],
+      });
       return result;
     }
 
@@ -1933,14 +1953,19 @@ app.post("/create-risk", authMiddleware, async (req: Request, res: Response) => 
       assertion_match: result.status === "success",
       screenshot_failure: result.screenshots?.failure || null,
     }, {
+      failure_type: result.message.includes("FAILED [") 
+        ? result.message.match(/FAILED \[(.+?)\]/)?.[1] || null 
+        : null,
       checks: {
         toast_confirmed: result.message.includes("Toast: ✓"),
         dashboard_visible: result.message.includes("Dashboard: ✓"),
         table_search: result.message.includes("Table: ✓"),
         fields_valid: result.message.includes("Fields: ✓"),
       },
+      field_mismatches: result.message.includes("Fields: ✗") 
+        ? result.message 
+        : [],
       table_screenshot: result.screenshots?.table_issue || null,
-      full_message: result.message,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
