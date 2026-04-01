@@ -947,7 +947,108 @@ async function createOptimizedContext(): Promise<{ browser: Browser; context: Br
   throw new Error("Failed to create browser context after retries");
 }
 
-// ─── CREATE RISK ─────────────────────────────────────────────────────────────
+// ─── Helper: Read risk row data from table ───────────────────────────────────
+
+interface RiskRowData {
+  title: string | null;
+  category: string | null;
+  status: string | null;
+  score: string | null;
+  owner: string | null;
+  cost: string | null;
+}
+
+async function readRiskRowFromTable(page: Page, title: string): Promise<RiskRowData | null> {
+  try {
+    await navigateTo(page, config.tableUrl);
+    await searchRisk(page, title);
+    await page.waitForTimeout(1_500);
+
+    const rowData = await page.evaluate((riskTitle) => {
+      // Find the row containing the risk title
+      const allRows = document.querySelectorAll("tr, [class*='border-b']");
+      for (const row of allRows) {
+        if (!row.textContent?.includes(riskTitle)) continue;
+
+        const cells = row.querySelectorAll("td, [role='cell'], > div");
+        const texts: string[] = [];
+        for (const cell of cells) {
+          texts.push(cell.textContent?.trim() || "");
+        }
+
+        // Try to extract structured data from badges and text
+        const badges = row.querySelectorAll("div.inline-flex");
+        let category: string | null = null;
+        let status: string | null = null;
+
+        const knownStatuses = ["Open", "In Review", "Mitigated", "Closed"];
+        const knownCategories = ["Budget", "Schedule", "Safety", "Quality", "Environmental", "Legal", "Technical", "Resource", "Other"];
+
+        for (const badge of badges) {
+          const badgeText = badge.textContent?.trim() || "";
+          if (knownStatuses.includes(badgeText)) status = badgeText;
+          if (knownCategories.includes(badgeText)) category = badgeText;
+        }
+
+        // Find score (standalone number 1-25)
+        let score: string | null = null;
+        const allEls = row.querySelectorAll("*");
+        for (const el of allEls) {
+          const t = el.textContent?.trim() || "";
+          if (el.children.length === 0 && /^\d{1,2}$/.test(t) && parseInt(t) >= 1 && parseInt(t) <= 25) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.width < 80) {
+              score = t;
+              break;
+            }
+          }
+        }
+
+        // Find owner (text that's not title, category, status, score, cost, or dash)
+        let owner: string | null = null;
+        let cost: string | null = null;
+        for (const el of allEls) {
+          const t = el.textContent?.trim() || "";
+          if (el.children.length === 0 && t.length > 0) {
+            if (t.startsWith("$") || t.includes(",")) {
+              cost = t;
+            } else if (
+              t !== riskTitle && t !== "—" && !knownStatuses.includes(t) &&
+              !knownCategories.includes(t) && !/^\d{1,2}$/.test(t) &&
+              t.length > 1 && t.length < 50 && !t.includes("Risk") &&
+              !t.includes(">")
+            ) {
+              if (!owner) owner = t;
+            }
+          }
+        }
+
+        return {
+          title: riskTitle,
+          category,
+          status,
+          score,
+          owner: owner || "—",
+          cost: cost || "—",
+        };
+      }
+      return null;
+    }, title);
+
+    if (rowData) {
+      console.log(`[TableRead] Row found: title="${rowData.title}" cat="${rowData.category}" status="${rowData.status}" score="${rowData.score}" owner="${rowData.owner}" cost="${rowData.cost}"`);
+    } else {
+      console.log(`[TableRead] Row not found for "${title}"`);
+    }
+
+    return rowData;
+  } catch (err) {
+    console.log(`[TableRead] Error: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+// ─── CREATE RISK (Enhanced) ──────────────────────────────────────────────────
 
 async function performCreateRisk(input: RiskInput): Promise<RiskResult> {
   let context: BrowserContext | null = null;
@@ -1829,8 +1930,17 @@ app.post("/create-risk", authMiddleware, async (req: Request, res: Response) => 
       message: result.message,
       assertion_expected: result.assertion.expected,
       assertion_actual: result.assertion.actual,
-      assertion_match: result.assertion.match,
+      assertion_match: result.status === "success",
       screenshot_failure: result.screenshots?.failure || null,
+    }, {
+      checks: {
+        toast_confirmed: result.message.includes("Toast: ✓"),
+        dashboard_visible: result.message.includes("Dashboard: ✓"),
+        table_search: result.message.includes("Table: ✓"),
+        fields_valid: result.message.includes("Fields: ✓"),
+      },
+      table_screenshot: result.screenshots?.table_issue || null,
+      full_message: result.message,
     });
     res.status(result.status === "error" ? 500 : 200).json(result);
   } catch (err) {
