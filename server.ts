@@ -2279,7 +2279,504 @@ app.post("/reset-browser", authMiddleware, async (_req: Request, res: Response) 
     timestamp: new Date().toISOString(),
   });
 });
+// ─── Audit Log Types ─────────────────────────────────────────────────────────
 
+interface AuditLogInput {
+  username: string;
+  password: string;
+  chatMessage?: string; // message to send in AI chat (default: "audit test message")
+}
+
+interface AuditStepResult {
+  status: "pass" | "fail";
+  filter_used: string;
+  expected_action: string;
+  actual_action: string | null;
+  expected_entity: string;
+  actual_entity: string | null;
+  expected_severity: string;
+  actual_severity: string | null;
+  summary_contains: string;
+  summary_found: boolean;
+  action_match: boolean;
+  entity_match: boolean;
+  severity_match: boolean;
+  error?: string;
+}
+
+interface AuditLogResult {
+  status: "pass" | "fail" | "error";
+  message: string;
+  username: string;
+  risk_title: string;
+  steps_summary: string;
+  total_steps: number;
+  passed: number;
+  failed: number;
+  steps: Record<string, AuditStepResult>;
+  screenshots: { failure: string | null };
+}
+
+// ─── Audit Log Helpers ───────────────────────────────────────────────────────
+
+async function navigateToAuditTrail(page: Page): Promise<void> {
+  console.log("[Audit] Navigating to /admin/audit");
+  await page.goto(config.baseUrl.replace("/dashboard", "") + "/admin/audit", {
+    waitUntil: "networkidle",
+    timeout: 30_000,
+  });
+  await page.waitForTimeout(2_000);
+  // Wait for table to load
+  await page.waitForSelector('[data-testid^="row-audit-log-"]', { timeout: 15_000 }).catch(() => {
+    console.log("[Audit] No audit rows visible yet — table might be empty or still loading");
+  });
+}
+
+async function applyAuditFilter(page: Page, actionType: string): Promise<void> {
+  console.log(`[Audit] Filtering by action: ${actionType}`);
+
+  // Open filters panel
+  const filtersBtn = page.locator('[data-testid="button-toggle-filters"]');
+  await filtersBtn.waitFor({ state: "visible", timeout: 5_000 });
+
+  // Check if filters panel is already open by looking for the action dropdown
+  const actionDropdown = page.locator('[data-testid="select-filter-action"]');
+  const isVisible = await actionDropdown.isVisible().catch(() => false);
+  if (!isVisible) {
+    await filtersBtn.click();
+    await page.waitForTimeout(1_000);
+  }
+
+  // Click action dropdown
+  await actionDropdown.waitFor({ state: "visible", timeout: 5_000 });
+  await actionDropdown.click();
+  await page.waitForTimeout(500);
+
+  // Select the action type from Radix dropdown
+  const option = page.locator(`[role="option"]`).filter({ hasText: new RegExp(`^${actionType}$`, "i") });
+  await option.waitFor({ state: "visible", timeout: 5_000 });
+  await option.click();
+  await page.waitForTimeout(2_000); // Wait for table to refresh
+  console.log(`[Audit] Filter applied: ${actionType}`);
+}
+
+async function clearAuditFilters(page: Page): Promise<void> {
+  const clearBtn = page.locator("text=Clear all");
+  const isVisible = await clearBtn.isVisible().catch(() => false);
+  if (isVisible) {
+    await clearBtn.click();
+    await page.waitForTimeout(1_500);
+    console.log("[Audit] Filters cleared");
+  }
+}
+
+async function verifyAuditEntry(
+  page: Page,
+  filterAction: string,
+  expectedAction: string,
+  expectedEntity: string,
+  expectedSeverity: string,
+  summaryContains: string,
+): Promise<AuditStepResult> {
+  const result: AuditStepResult = {
+    status: "fail",
+    filter_used: filterAction,
+    expected_action: expectedAction,
+    actual_action: null,
+    expected_entity: expectedEntity,
+    actual_entity: null,
+    expected_severity: expectedSeverity,
+    actual_severity: null,
+    summary_contains: summaryContains,
+    summary_found: false,
+    action_match: false,
+    entity_match: false,
+    severity_match: false,
+  };
+
+  try {
+    // Navigate to audit trail fresh each time
+    await navigateToAuditTrail(page);
+
+    // Clear any existing filters first
+    await clearAuditFilters(page);
+
+    // Apply the action filter
+    await applyAuditFilter(page, filterAction);
+
+    // Get all visible rows
+    const rows = page.locator('[data-testid^="row-audit-log-"]');
+    const rowCount = await rows.count();
+    console.log(`[Audit] Found ${rowCount} rows for filter: ${filterAction}`);
+
+    if (rowCount === 0) {
+      result.error = `No rows found for filter: ${filterAction}`;
+      return result;
+    }
+
+    // Search through rows for matching summary
+    for (let i = 0; i < Math.min(rowCount, 20); i++) {
+      const row = rows.nth(i);
+
+      // Read summary (5th column)
+      const summaryEl = row.locator("td:nth-child(5)");
+      const summaryText = await summaryEl.textContent() || "";
+
+      if (summaryText.toLowerCase().includes(summaryContains.toLowerCase())) {
+        result.summary_found = true;
+
+        // Read action badge (3rd column)
+        const actionEl = row.locator("td:nth-child(3)");
+        result.actual_action = (await actionEl.textContent() || "").trim();
+
+        // Read entity (4th column — first line is type, second is ID)
+        const entityEl = row.locator("td:nth-child(4) .capitalize");
+        result.actual_entity = (await entityEl.textContent() || "").trim();
+
+        // Read severity (6th column)
+        const severityEl = row.locator("td:nth-child(6)");
+        result.actual_severity = (await severityEl.textContent() || "").trim().toLowerCase();
+
+        // Assert
+        result.action_match = result.actual_action?.toLowerCase() === expectedAction.toLowerCase();
+        result.entity_match = result.actual_entity?.toLowerCase() === expectedEntity.toLowerCase();
+        result.severity_match = result.actual_severity === expectedSeverity.toLowerCase();
+
+        if (result.action_match && result.entity_match && result.severity_match) {
+          result.status = "pass";
+        }
+
+        console.log(`[Audit] ${filterAction}: found="${result.summary_found}" action="${result.actual_action}" entity="${result.actual_entity}" severity="${result.actual_severity}" → ${result.status}`);
+        return result;
+      }
+    }
+
+    result.error = `No row found with summary containing: "${summaryContains}"`;
+    console.log(`[Audit] ${filterAction}: ${result.error}`);
+    return result;
+  } catch (err) {
+    result.error = (err as Error).message;
+    console.log(`[Audit] ${filterAction} error: ${result.error}`);
+    return result;
+  }
+}
+
+// ─── Audit Log: Perform Chat Message ─────────────────────────────────────────
+
+async function sendChatMessage(page: Page, message: string): Promise<boolean> {
+  try {
+    console.log(`[Chat] Sending message: "${message}"`);
+
+    // Click the chat widget button
+    const chatBtn = page.locator('[data-testid="button-chat-widget"]');
+    await chatBtn.waitFor({ state: "visible", timeout: 10_000 });
+    await chatBtn.click();
+    await page.waitForTimeout(1_500);
+
+    // Type message in the chat input
+    const chatInput = page.locator('input[placeholder="Type a message..."]');
+    await chatInput.waitFor({ state: "visible", timeout: 5_000 });
+    await chatInput.fill(message);
+    await page.waitForTimeout(500);
+
+    // Click send button
+    const sendBtn = page.locator('button[type="submit"].rounded-full');
+    await sendBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await sendBtn.click();
+
+    // Wait for response (assistant message)
+    await page.waitForTimeout(5_000);
+    console.log("[Chat] Message sent successfully");
+    return true;
+  } catch (err) {
+    console.log(`[Chat] Failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+// ─── Audit Log: Perform Logout ───────────────────────────────────────────────
+
+async function performLogout(page: Page): Promise<boolean> {
+  try {
+    console.log("[Logout] Starting logout");
+
+    // Click the avatar (JJ) to open dropdown
+    const avatar = page.locator("div.rounded-full span.text-white").filter({ hasText: /^[A-Z]{1,2}$/ }).first();
+    await avatar.waitFor({ state: "visible", timeout: 5_000 });
+    await avatar.click();
+    await page.waitForTimeout(1_000);
+
+    // Click "Sign out"
+    const logoutBtn = page.locator('[data-testid="menu-item-logout"]');
+    await logoutBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await logoutBtn.click();
+
+    // Wait for redirect to login page
+    await page.waitForTimeout(3_000);
+    const url = page.url();
+    const success = url.includes("/login") || url.includes("/sign-in");
+    console.log(`[Logout] ${success ? "Success" : "Failed"} — URL: ${url}`);
+    return success;
+  } catch (err) {
+    console.log(`[Logout] Failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+// ─── Audit Log: Main Perform Function ────────────────────────────────────────
+
+async function performAuditLog(input: AuditLogInput): Promise<AuditLogResult> {
+  const timestamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 15);
+  const riskTitle = `AuditTest_${timestamp}`;
+  const chatMsg = input.chatMessage || "audit test message";
+
+  const result: AuditLogResult = {
+    status: "error",
+    message: "",
+    username: input.username,
+    risk_title: riskTitle,
+    steps_summary: "",
+    total_steps: 6,
+    passed: 0,
+    failed: 0,
+    steps: {} as Record<string, AuditStepResult>,
+    screenshots: { failure: null },
+  };
+
+  let context: BrowserContext | null = null;
+
+  try {
+    const { context: ctx } = await createOptimizedContext();
+    context = ctx;
+    const page = context.pages()[0];
+
+    // ── Step 0: Login ──────────────────────────────────────────────────────
+    console.log("[AuditLog] === STEP 0: Login ===");
+    const loginOk = await loginToCaptus(page, input.username, input.password);
+    if (!loginOk) {
+      result.status = "error";
+      result.message = "Login failed";
+      result.screenshots.failure = await captureFailure(context, "audit_login_fail");
+      return result;
+    }
+
+    // ── Step 1: Create Risk ────────────────────────────────────────────────
+    console.log("[AuditLog] === STEP 1: Create Risk ===");
+    await navigateTo(page, config.dashboardUrl);
+    await page.waitForTimeout(2_000);
+
+    // Click "Add New Risk" button
+    const addBtn = page.locator('[data-testid="button-add-risk"]');
+    await addBtn.waitFor({ state: "visible", timeout: 10_000 });
+    await addBtn.click();
+    await page.waitForTimeout(1_500);
+
+    // Fill form
+    await fillFormField(page, '[data-testid="input-risk-title"]', riskTitle);
+    await fillFormField(page, '[data-testid="input-risk-description"]', "Audit log test risk");
+    await selectDropdown(page, '[data-testid="select-risk-category"]', "Technical");
+    await selectDropdown(page, '[data-testid="select-risk-status"]', "Open");
+    await selectDropdown(page, '[data-testid="select-risk-impact"]', "3 - Medium");
+    await selectDropdown(page, '[data-testid="select-risk-likelihood"]', "3 - Medium");
+
+    // Save
+    const saveBtn = page.locator('[data-testid="button-save-risk"]');
+    await saveBtn.click();
+    const createToast = await detectToast(page, "Risk created successfully");
+    console.log(`[AuditLog] Create risk: ${createToast.match ? "OK" : "FAIL"}`);
+
+    if (!createToast.match) {
+      result.screenshots.failure = await captureFailure(context, "audit_create_fail");
+    }
+    await page.waitForTimeout(2_000);
+
+    // ── Step 2: Edit Risk ──────────────────────────────────────────────────
+    console.log("[AuditLog] === STEP 2: Edit Risk ===");
+    // Search for the risk on dashboard
+    await navigateTo(page, config.dashboardUrl);
+    await page.waitForTimeout(2_000);
+
+    // Find and click edit button for our risk
+    const riskRow = page.locator(`text=${riskTitle}`).first();
+    await riskRow.waitFor({ state: "visible", timeout: 10_000 });
+
+    // Click the edit button near this risk
+    const editBtn = page.locator('[data-testid^="button-edit-heatmap-risk-"]').first();
+    await editBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await editBtn.click();
+    await page.waitForTimeout(1_500);
+
+    // Update description
+    await fillFormField(page, '[data-testid="input-risk-description"]', "Updated by audit log test");
+
+    // Click Update Risk
+    const updateBtn = page.locator('[data-testid="button-save-risk"]');
+    await updateBtn.click();
+    const editToast = await detectToast(page, "Risk updated successfully");
+    console.log(`[AuditLog] Edit risk: ${editToast.match ? "OK" : "FAIL"}`);
+    await page.waitForTimeout(2_000);
+
+    // ── Step 3: Delete Risk ────────────────────────────────────────────────
+    console.log("[AuditLog] === STEP 3: Delete Risk ===");
+    await navigateTo(page, config.tableUrl);
+    await page.waitForTimeout(2_000);
+
+    // Search for risk
+    await searchRisk(page, riskTitle);
+
+    // Click risk row to expand
+    const riskLink = page.locator(`text=${riskTitle}`).first();
+    await riskLink.waitFor({ state: "visible", timeout: 10_000 });
+    await riskLink.click();
+    await page.waitForTimeout(1_500);
+
+    // Click delete
+    const deleteBtn = page.locator('[data-testid^="button-delete-risk-"]').first();
+    await deleteBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await deleteBtn.click();
+    const deleteToast = await detectToast(page, "Risk deleted successfully");
+    console.log(`[AuditLog] Delete risk: ${deleteToast.match ? "OK" : "FAIL"}`);
+    await page.waitForTimeout(2_000);
+
+    // ── Step 4: Send Chat Message ──────────────────────────────────────────
+    console.log("[AuditLog] === STEP 4: Send Chat Message ===");
+    // Navigate somewhere with the chat widget visible
+    await navigateTo(page, config.dashboardUrl);
+    await page.waitForTimeout(2_000);
+    const chatOk = await sendChatMessage(page, chatMsg);
+    console.log(`[AuditLog] Chat message: ${chatOk ? "OK" : "FAIL"}`);
+    await page.waitForTimeout(2_000);
+
+    // ── Step 5: Logout ─────────────────────────────────────────────────────
+    console.log("[AuditLog] === STEP 5: Logout ===");
+    const logoutOk = await performLogout(page);
+    console.log(`[AuditLog] Logout: ${logoutOk ? "OK" : "FAIL"}`);
+
+    // ── Re-login to verify audit trail ─────────────────────────────────────
+    console.log("[AuditLog] === Re-login for audit verification ===");
+    const reloginOk = await loginToCaptus(page, input.username, input.password);
+    if (!reloginOk) {
+      result.status = "error";
+      result.message = "Re-login failed for audit verification";
+      result.screenshots.failure = await captureFailure(context, "audit_relogin_fail");
+      return result;
+    }
+    await page.waitForTimeout(2_000);
+
+    // ── Step 6: Verify all 6 audit entries ─────────────────────────────────
+    console.log("[AuditLog] === VERIFICATION PHASE ===");
+
+    // 1. Verify Login
+    console.log("[AuditLog] Verifying: Login");
+    result.steps.login = await verifyAuditEntry(
+      page, "Login", "Login", "Session", "Info", input.username,
+    );
+
+    // 2. Verify Create
+    console.log("[AuditLog] Verifying: Create");
+    result.steps.create_risk = await verifyAuditEntry(
+      page, "Create", "Create", "Risk", "Info", riskTitle,
+    );
+
+    // 3. Verify Update
+    console.log("[AuditLog] Verifying: Update");
+    result.steps.edit_risk = await verifyAuditEntry(
+      page, "Update", "Update", "Risk", "Info", riskTitle,
+    );
+
+    // 4. Verify Delete
+    console.log("[AuditLog] Verifying: Delete");
+    result.steps.delete_risk = await verifyAuditEntry(
+      page, "Delete", "Delete", "Risk", "Warning", riskTitle,
+    );
+
+    // 5. Verify Chat Message
+    console.log("[AuditLog] Verifying: Message");
+    result.steps.chat_message = await verifyAuditEntry(
+      page, "Message", "Message", "Chat Message", "Info", "user message",
+    );
+
+    // 6. Verify Logout
+    console.log("[AuditLog] Verifying: Logout");
+    result.steps.logout = await verifyAuditEntry(
+      page, "Logout", "Logout", "Session", "Info", input.username,
+    );
+
+    // ── Calculate results ──────────────────────────────────────────────────
+    const stepNames = ["login", "create_risk", "edit_risk", "delete_risk", "chat_message", "logout"];
+    const labels = ["Login", "Create", "Update", "Delete", "Message", "Logout"];
+
+    result.passed = stepNames.filter(s => result.steps[s]?.status === "pass").length;
+    result.failed = result.total_steps - result.passed;
+    result.status = result.failed === 0 ? "pass" : "fail";
+
+    // Build steps_summary: Login:✅ Create:✅ Update:❌ ...
+    result.steps_summary = labels.map((label, i) => {
+      const s = result.steps[stepNames[i]];
+      return `${label}:${s?.status === "pass" ? "✅" : "❌"}`;
+    }).join(" ");
+
+    result.message = result.steps_summary;
+
+    if (result.failed > 0 && !result.screenshots.failure) {
+      result.screenshots.failure = await captureFailure(context, "audit_verification_fail");
+    }
+
+    console.log(`[AuditLog] === RESULT: ${result.status.toUpperCase()} (${result.passed}/${result.total_steps}) ===`);
+    console.log(`[AuditLog] ${result.steps_summary}`);
+
+    return result;
+  } catch (err) {
+    result.screenshots.failure = await captureFailure(context, "audit_error");
+    result.status = "error";
+    result.message = (err as Error).message;
+    console.log(`[AuditLog] Error: ${result.message}`);
+    return result;
+  } finally {
+    await safeClose(context);
+  }
+}
+
+// ─── Audit Log: Express Route ────────────────────────────────────────────────
+
+app.post("/audit-log", authMiddleware, async (req: Request, res: Response) => {
+  const input = req.body as Partial<AuditLogInput>;
+  if (!input.username || !input.password) {
+    res.status(400).json({ status: "error", message: "Missing: username, password" });
+    return;
+  }
+
+  try {
+    const result = await performAuditLog(input as AuditLogInput);
+
+    await saveTestResult("TC_Audit_Log", {
+      status: result.status,
+      username: result.username,
+      risk_title: result.risk_title,
+      message: result.steps_summary,
+      assertion_expected: `All ${result.total_steps} audit entries verified`,
+      assertion_actual: `${result.passed} of ${result.total_steps} audit entries verified (${result.passed}/${result.total_steps})`,
+      assertion_match: result.failed === 0,
+      screenshot_failure: result.screenshots?.failure || null,
+    }, {
+      total_steps: result.total_steps,
+      passed: result.passed,
+      failed: result.failed,
+      steps: result.steps,
+    });
+
+    res.status(result.status === "error" ? 500 : 200).json(result);
+  } catch (err) {
+    await saveTestResult("TC_Audit_Log", {
+      status: "error",
+      username: input.username!,
+      message: (err as Error).message,
+      assertion_expected: "All 6 audit entries verified",
+      assertion_match: false,
+    }, {});
+    res.status(500).json({ status: "error", message: (err as Error).message });
+  }
+});
 // ─── Health Check ────────────────────────────────────────────────────────────
 
 app.get("/health", (_req: Request, res: Response) => {
