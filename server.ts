@@ -1559,8 +1559,7 @@ async function performAuditLog(input: AuditLogInput): Promise<AuditLogResult> {
     console.log("[AuditLog] Verifying: Message");
     result.steps.chat_message = await verifyAuditEntry(page, "Message", "Message", "Chat Message", "Info", "user message");
     console.log("[AuditLog] Verifying: Logout");
-    result.steps.logout = await verifyAuditEntry(page, "Logout", "Logout", "Session", "Info", input.username);
-
+    result.steps.logout = await verifyAuditEntry(page, "Logout", "Logout", "Session", "Info", "User logged out");
     // ── CALCULATE RESULTS ────────────────────────────────────────────────
     const stepKeys = ["login", "create_risk", "edit_risk", "delete_risk", "chat_message", "logout"];
     const stepLabels = ["Login", "Create", "Update", "Delete", "Message", "Logout"];
